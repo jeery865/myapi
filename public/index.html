@@ -284,6 +284,32 @@
       </div>
 
       <div class="setgroup">
+        <div class="eyebrow"><b>限流与降级</b><span>RATE LIMITS</span>
+          <span class="eyebrow-note" id="s-fallback-state">—</span>
+        </div>
+        <div class="setlist">
+          <div class="setrow">
+            <span class="sk">模型降级</span>
+            <div class="sv">
+              <select id="set-fallback">
+                <option value="off">不降级</option>
+                <option value="tier">同档位内降级</option>
+                <option value="any">任意可用模型降级</option>
+              </select>
+              <p class="sh">上游按模型限流（RPM）时，先把这个请求换到别的模型上，让你继续用；被限的那个账号仍会在后台自动复检。降级会照样过一遍授权检查，不会绕过付费模型的限制。</p>
+            </div>
+          </div>
+          <div class="setrow">
+            <span class="sk">账号复检</span>
+            <div class="sv">
+              <input type="number" id="set-recheck" min="0" max="1440" step="1" inputmode="numeric">
+              <p class="sh">分钟。临时限流的账号到点后自动探活，好了就恢复可用，不用手动刷新。填 <code>0</code> 关闭。默认 5 分钟。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="setgroup">
         <div class="eyebrow"><b>聊天记录</b><span>TRANSCRIPTS</span>
           <span class="eyebrow-note" id="s-chat-state">—</span>
         </div>

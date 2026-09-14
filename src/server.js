@@ -16,6 +16,7 @@ import { handleAdminApi, isAuthed } from './admin.js';
 import { handleApiRequest, callWorker } from './engine.js';
 import { getSession, closeAllBrowsers, browserFeature } from './browser.js';
 import { refreshCatalog, noteEngineModelList } from './models.js';
+import { startScheduler } from './scheduler.js';
 import { sendJson, sendText, publicBaseUrl } from './util.js';
 
 const MIME = {
@@ -258,6 +259,9 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
         } catch {}
       })
       .catch(() => {});
+    // 后台定时任务：账号状态的到期复检 + 定期叫一次模型表刷新。
+    // 放在监听之后启动 —— 网络已经就绪，早起的 tick 不会白跑。
+    startScheduler();
   };
 
   // 先试 IPv6 双栈，不行再退 IPv4；两个都失败才退出（并把原因打清楚）

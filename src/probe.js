@@ -3,6 +3,7 @@
 import { config } from './config.js';
 import { httpJson } from './util.js';
 import { learnFromQuotaSnapshot } from './models.js';
+import { classifyRateLimit, withRecoverAt } from './account-status.js';
 
 function formatQuota(rateLimits) {
   if (!rateLimits || typeof rateLimits !== 'object') return '';
@@ -61,7 +62,19 @@ export async function probeAccount(token) {
     return { ...base, state: 'blocked', verdict: '访问被拒', detail: `HTTP 403：${JSON.stringify(data || resp.text).slice(0, 160)}` };
   }
   if (resp.status === 429) {
-    return { ...base, state: 'rate_limited', verdict: '额度用完', detail: `HTTP 429：当天 session 额度已用完，等重置${quota ? `（${quota}）` : ''}` };
+    // 429 ≠ "当天额度用完"。rateLimitsByModel 里的 recentCount/limit 是**滚动窗口**
+    // 计数，窗口滚过去就恢复（分钟级）。所以这里按正文的重试提示分流，
+    // 详见 src/account-status.js 开头。以前一律写成"当天额度已用完"，
+    // 用户看一眼就以为号废了，只能手动再来刷一次。
+    const state = classifyRateLimit(resp.text, 429);
+    return withRecoverAt({
+      ...base,
+      state,
+      verdict: state === 'throttled' ? '临时限流' : '额度用完',
+      detail: state === 'throttled'
+        ? `HTTP 429：上游正在限流（滚动窗口打满），稍后自动恢复${quota ? `（${quota}）` : ''}`
+        : `HTTP 429：当天 session 额度已用完，等重置${quota ? `（${quota}）` : ''}`,
+    }, resp.text, 429);
   }
   if (resp.status === 404) {
     return { ...base, state: 'ok', verdict: '存活', detail: `HTTP 404：当前无活跃 session，账号可用${quota ? `（${quota}）` : ''}` };
@@ -70,9 +83,9 @@ export async function probeAccount(token) {
   const st = data?.status;
   if (st === 'banned') return { ...base, state: 'banned', verdict: '已封禁', detail: '上游返回 status=banned（终态）' };
   if (st === 'country_blocked') return { ...base, state: 'country_blocked', verdict: '地区受限', detail: '出口 IP 非美国，免费模型受限' };
-  if (st === 'rate_limited') return { ...base, state: 'rate_limited', verdict: '额度用完', detail: `当天 session 额度已用完${quota ? `（${quota}）` : ''}` };
-  if (st === 'model_locked') return { ...base, state: 'model_locked', verdict: '存活（被占用）', detail: `另一个模型的 session 占用中，稍后释放${quota ? `（${quota}）` : ''}` };
-  if (st === 'ip_capped') return { ...base, state: 'ip_capped', verdict: '存活（IP 满）', detail: '当前出口 IP 活跃用户过多，稍后重试' };
+  if (st === 'rate_limited') return withRecoverAt({ ...base, state: 'rate_limited', verdict: '额度用完', detail: `当天 session 额度已用完${quota ? `（${quota}）` : ''}` }, resp.text, resp.status);
+  if (st === 'model_locked') return withRecoverAt({ ...base, state: 'model_locked', verdict: '存活（被占用）', detail: `另一个模型的 session 占用中，稍后释放${quota ? `（${quota}）` : ''}` }, resp.text, resp.status);
+  if (st === 'ip_capped') return withRecoverAt({ ...base, state: 'ip_capped', verdict: '存活（IP 满）', detail: '当前出口 IP 活跃用户过多，稍后重试' }, resp.text, resp.status);
   if (st === 'active') {
     return { ...base, state: 'ok', verdict: '存活（session 活跃）', detail: `model=${data?.model || '?'}, tier=${data?.accessTier || '?'}${quota ? `，${quota}` : ''}` };
   }

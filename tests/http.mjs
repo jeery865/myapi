@@ -252,6 +252,18 @@ void off;
 const log2 = (await admin('/chatlog')).json;
 check('关掉之后不再记新的', !log2.recent.some((r) => (r.preview || '').includes('这句不该被记下来')), 'off 之后还在记');
 
+// ── 限流与降级设置（控制台上新加的两个开关） ──
+// 前端读到的是 /state.settings，所以往返必须是走一遍 HTTP 才作数。
+await admin('/settings', 'PATCH', { modelFallback: '不要降级啊' });
+check('降级模式写非法值 → 落库退回 off', (await admin('/state')).json.settings.modelFallback === 'off', '非法值没被兜住');
+await admin('/settings', 'PATCH', { modelFallback: 'tier' });
+check('降级模式能存成 tier 并被 /state 透出', (await admin('/state')).json.settings.modelFallback === 'tier', 'tier 没存上');
+await admin('/settings', 'PATCH', { accountRecheckMinutes: 99999 });
+check('复检间隔超上限被拒（保留原值 5）', (await admin('/state')).json.settings.accountRecheckMinutes === 5, '上限没兜住');
+await admin('/settings', 'PATCH', { accountRecheckMinutes: 0 });
+check('复检间隔 0（=关闭）是合法值', (await admin('/state')).json.settings.accountRecheckMinutes === 0, '0 没存上');
+await admin('/settings', 'PATCH', { modelFallback: 'off', accountRecheckMinutes: 5 });
+
 // ── 存储盘点 + 分级清理 ──
 const store1 = (await admin('/storage')).json;
 check('存储盘点列出了各类占用', store1.storage.items.length >= 5 && typeof store1.storage.totalBytes === 'number', JSON.stringify(store1.storage.items.map((i) => i.key)));

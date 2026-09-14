@@ -111,6 +111,9 @@ function providerName(id) {
 const LAMP_BY_STATE = {
   ok: 'ok',
   metered: 'ok',
+  // 临时限流：滚动窗口打满，分钟级就会自己好。是**提醒**，不是坏号 ——
+  // 以前它跟"额度用完"共用同一个状态，用户看一眼就以为号废了。
+  throttled: 'warn',
   model_locked: 'warn',
   rate_limited: 'warn',
   ip_capped: 'warn',
@@ -122,9 +125,44 @@ const LAMP_BY_STATE = {
   banned: 'bad',
 };
 
+/**
+ * 这个状态现在还算数吗。
+ * 带 recoverAt 且已过期 → 不算数了，等价于"没标记"。后端选号逻辑用的是同一个口径
+ * （src/account-status.js 的 isStatusLive），所以"时间一到自己就好"在界面上也成立，
+ * 用户不需要为了消掉一个黄灯去点刷新。
+ * 没有 recoverAt 的是终态（token_invalid / banned），永远算数。
+ */
+function statusLive(st) {
+  if (!st || !st.state) return false;
+  if (st.state === 'ok') return false;
+  if (!st.recoverAt) return true;
+  const at = Date.parse(st.recoverAt);
+  return !Number.isFinite(at) || at > Date.now();
+}
+
+/** 还有多久恢复（毫秒）。没有到期时间或已过期时返回 0 */
+function recoverIn(st) {
+  if (!st || !st.recoverAt) return 0;
+  const at = Date.parse(st.recoverAt);
+  if (!Number.isFinite(at)) return 0;
+  return Math.max(0, at - Date.now());
+}
+
+/** 毫秒说人话 */
+function humanMs(ms) {
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s} 秒`;
+  const m = Math.ceil(s / 60);
+  return m < 60 ? `${m} 分钟` : `${Math.ceil(m / 60)} 小时`;
+}
+
 function lampFor(acct) {
   if (acct.enabled === false) return '';
-  if (acct.status?.state) return LAMP_BY_STATE[acct.status.state] || '';
+  if (acct.status?.state) {
+    // 过期的坏状态按"已恢复"处理，给绿灯 —— 跟后端选号口径一致，别自己吓自己
+    if (!statusLive(acct.status) && acct.status.state !== 'ok') return 'ok';
+    return LAMP_BY_STATE[acct.status.state] || '';
+  }
   if (acct.workerState?.alive === true) return 'ok';
   if (acct.workerState?.alive === false) return 'bad';
   return '';
@@ -475,7 +513,9 @@ function render() {
   const ups = s.providers?.list || [];
   const okCount = ups.length
     ? ups.reduce((n, u) => n + (u.accountsEnabled || 0), 0)
-    : s.accounts.filter((a) => a.enabled && (!a.status || a.status.state === 'ok')).length;
+    // 「可用」= 没被停用，且没有**仍然算数**的坏状态。过期的坏状态不算坏 ——
+    // 后端已经在用它了，计数口径得跟后端一致，否则顶栏会一直报"有号不可用"
+    : s.accounts.filter((a) => a.enabled && (!a.status?.state || a.status.state === 'ok' || !statusLive(a.status))).length;
   const lamp = acctTotal === 0 ? 'bad' : okCount > 0 ? 'ok' : 'warn';
   pill.querySelector('.lamp').className = `lamp ${lamp}`;
   pill.querySelector('span').textContent = acctTotal === 0 ? '号池为空' : `${okCount}/${acctTotal} 号可用`;
@@ -896,8 +936,13 @@ function renderOverview(s) {
     .filter((u) => u.accounts > 0 || u.builtin)
     .map((u) => {
       const mine = s.accounts.filter((a) => (a.provider || 'freebuff') === u.id);
-      const alive = mine.filter((a) => a.enabled !== false && (!a.status || a.status.state === 'ok' || a.status.state === 'metered'));
-      const bad = mine.filter((a) => a.status && ['token_invalid', 'banned', 'no_credit'].includes(a.status.state));
+      const alive = mine.filter(
+        (a) =>
+          a.enabled !== false &&
+          (!a.status?.state || a.status.state === 'ok' || a.status.state === 'metered' || !statusLive(a.status))
+      );
+      // 只有**仍然算数**的坏状态才算坏；过期的已经在正常参与调度了
+      const bad = mine.filter((a) => a.status && statusLive(a.status) && ['token_invalid', 'banned', 'no_credit'].includes(a.status.state));
       // 最满的那个额度，画在条上
       let worst = null;
       for (const a of mine) {
@@ -1017,8 +1062,31 @@ function renderAccounts(s) {
   tbody.innerHTML = rows
     .map((a) => {
       const st = a.status;
-      const tagClass = st ? (LAMP_BY_STATE[st.state] === 'ok' ? 'ok' : LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn') : '';
-      const label = st ? st.verdict : a.workerState ? `引擎观测 ${a.workerState.state}` : '未检测';
+      // 三档：ok 绿 / 有效的坏状态 黄或红 / 已过期的坏状态 当已恢复（绿）
+      let tagClass = '';
+      let label = '未检测';
+      let tip = '点检测做一次探活';
+      if (st) {
+        if (st.state === 'ok') {
+          tagClass = 'ok';
+          label = st.verdict;
+          tip = st.detail || '';
+        } else if (statusLive(st)) {
+          const wait = recoverIn(st);
+          tagClass = LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn';
+          // 会自己好的那些，直接把倒计时摆出来 —— 用户看到"1 分钟后自动恢复"就不会
+          // 以为号废了，也不会去点刷新
+          label = wait ? `${st.verdict} · ${humanMs(wait)}后自动恢复` : st.verdict;
+          tip = `${st.detail || ''}${wait ? `\n冷却中：约 ${humanMs(wait)} 后自动恢复，不需要手动刷新` : ''}`;
+        } else {
+          tagClass = 'ok';
+          label = '已自动恢复';
+          tip = `${st.detail || ''}\n（恢复时间已过，这个号已在正常参与调度；后台复检会实测确认一下）`;
+        }
+      } else if (a.workerState) {
+        label = `引擎观测 ${a.workerState.state}`;
+        tip = '';
+      }
       // 自定义上游的号只是一个 API key，没有邮箱也没有名字 —— 那就拿打码的 key 当标题，
       // 显示"未知邮箱"只会让人以为出错了
       const title = a.email || a.name || a.tokenMasked;
@@ -1032,7 +1100,7 @@ function renderAccounts(s) {
           .map(([v, t]) => `<option value="${v}"${a.pool === v ? ' selected' : ''}>${t}</option>`)
           .join('')}
       </select></td>
-      <td><span class="tag ${tagClass}" title="${esc(st?.detail || '点检测做一次探活')}">${esc(label)}</span></td>
+      <td><span class="tag ${tagClass}" title="${esc(tip)}">${esc(label)}</span></td>
       <td class="cell-mono">${esc(st?.quota || '—')}</td>
       <td class="cell-mono">${a.email || a.name ? esc(a.tokenMasked) : '—'}</td>
       <td class="acts">
@@ -1290,6 +1358,13 @@ $('#btn-model-status-reset').addEventListener('click', async () => {
 
 function renderSettings(s) {
   $('#set-allowpaid').checked = Boolean(s.settings.allowPaidDefault);
+  // 限流与降级：默认都是最保守的一档，用户自己决定要不要更激进的接管
+  const fb = s.settings.modelFallback || 'off';
+  $('#set-fallback').value = fb;
+  $('#s-fallback-state').textContent =
+    fb === 'off' ? '关闭' : fb === 'tier' ? '同档位内接管' : '可跨档位接管';
+  const recheck = Number(s.settings.accountRecheckMinutes);
+  $('#set-recheck').value = Number.isFinite(recheck) ? recheck : 5;
   // 目录和持久性挤在一行：持久性是这个目录的属性，分成两行反而要来回看
   $('#s-datadir').textContent = `${s.storage.dir}　${s.storage.persistent ? '持久' : '临时 · 重新部署会清空'}`;
   $('#s-persist-note').textContent = s.storage.volume
@@ -1451,6 +1526,26 @@ $('#btn-model-refresh').addEventListener('click', async () => {
 $('#set-allowpaid').addEventListener('change', async (ev) => {
   await api('/settings', { method: 'PATCH', body: { allowPaidDefault: ev.target.checked } });
   toast('已保存');
+});
+$('#set-fallback').addEventListener('change', async (ev) => {
+  try {
+    await api('/settings', { method: 'PATCH', body: { modelFallback: ev.target.value } });
+    toast(ev.target.value === 'off' ? '已关闭模型降级' : '已保存 —— 限流时会先换模型顶上');
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+$('#set-recheck').addEventListener('change', async (ev) => {
+  const n = Math.max(0, Math.min(1440, Math.round(Number(ev.target.value) || 0)));
+  ev.target.value = n;
+  try {
+    await api('/settings', { method: 'PATCH', body: { accountRecheckMinutes: n } });
+    toast(n === 0 ? '已关闭后台复检' : `已保存 —— 每 ${n} 分钟复检一次限流账号`);
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
 });
 $('#btn-export').addEventListener('click', async () => {
   const btn = $('#btn-export');

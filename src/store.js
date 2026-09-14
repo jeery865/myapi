@@ -69,6 +69,17 @@ function emptyData() {
       chatLogEnabled: false,
       chatLogMaxMB: 200,
       chatLogMaxRecordKB: 256,
+      // 模型降级：原模型在所有账号上都撞限流/额度耗尽时，换一个模型把这次请求答完，
+      // 而不是把 429 甩给客户端。
+      //   off   默认。失败就如实返回，绝不悄悄换模型
+      //   tier  只在同一档位内换（免费→免费、付费→付费）—— 不会拿免费请求去烧付费额度
+      //   any   不限档位，但仍然严守 key 的 allowPaid 开关
+      // 之所以默认 off：静默换模型会让客户端拿到"不是它要的那个模型"的回答，
+      // 这种事必须由部署者自己决定开不开。
+      modelFallback: 'off',
+      // 后台复检间隔（分钟）。0 = 关闭。
+      // 到期状态（recoverAt 已过）由它来清理，这样"撞一次限流就得手动刷新"就没了。
+      accountRecheckMinutes: 5,
     },
     // 模型实测状态：id -> { state, at, detail, fails }
     modelStatus: {},
@@ -490,6 +501,16 @@ class Store {
     if ('chatLogMaxRecordKB' in patch) {
       const n = Number(patch.chatLogMaxRecordKB);
       if (Number.isFinite(n) && n >= 4 && n <= 8192) s.chatLogMaxRecordKB = Math.floor(n);
+    }
+    if ('modelFallback' in patch) {
+      const v = String(patch.modelFallback || '').trim().toLowerCase();
+      // 认不出的一律退回 off —— 宁可明确失败，也别因为拼错一个词就开始悄悄换模型
+      s.modelFallback = ['off', 'tier', 'any'].includes(v) ? v : 'off';
+    }
+    if ('accountRecheckMinutes' in patch) {
+      const n = Number(patch.accountRecheckMinutes);
+      // 0 是合法值（= 关闭）。上限一天，避免手滑写个 100000 把定时器变成几乎不跑
+      if (Number.isFinite(n) && n >= 0 && n <= 1440) s.accountRecheckMinutes = Math.floor(n);
     }
     if ('activeAccountId' in patch) {
       const id = patch.activeAccountId ? String(patch.activeAccountId) : null;

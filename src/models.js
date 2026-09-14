@@ -623,6 +623,46 @@ export function checkModelAccess(keyRecord, modelId) {
 }
 
 /**
+ * 模型降级的候选列表。
+ *
+ * 只在"原模型这次失败、而且换账号也没用"（限流 / 额度耗尽）时才会被调用 —— 见
+ * src/engine.js 的 shouldFallback。候选必须同时满足：
+ *   1. 同一个上游。换上游等于换一套凭据，而当前 key 未必授权过那个上游；
+ *      更要紧的是自定义上游那条路会把 key 发给第三方，不能自动替用户做这个决定。
+ *   2. 过 checkModelAccess —— 下架名单、key 的模型白名单、allowPaid 一律照旧，
+ *      降级**不能**成为绕过付费授权的后门。
+ *   3. 不在实测不可用的名单里。
+ *   4. 档位符合 settings.modelFallback：tier 只给同档位；any 不限档位。
+ *
+ * 排序：同一个额度池（standard / glm / premium）的排前面 —— 同池通常意味着相近的
+ * 能力和额度语义，降级后落差最小。同池里免费优先（省钱）。
+ * 返回的是模型 id 数组，最多 limit 个（降级是救命手段，不是遍历整张表）。
+ */
+export function fallbackCandidates(modelId, keyRecord, { limit = 3 } = {}) {
+  const mode = store.settings?.modelFallback;
+  if (!modelId || (mode !== 'tier' && mode !== 'any')) return [];
+  const baseTier = tierOf(modelId);
+  const provider = providerForModel(modelId);
+  const all = catalog();
+  const basePool = all.find((m) => m.id === modelId)?.pool || '';
+  const poolRank = (m) => (m.pool === basePool ? 0 : 1);
+  const picked = all.filter((m) => {
+    if (m.id === modelId) return false;
+    if (m.provider !== provider) return false;
+    if (mode === 'tier' && m.tier !== baseTier) return false;
+    if (!m.enabled) return false;
+    if (availabilityOf(m.id).state === 'unavailable') return false;
+    return checkModelAccess(keyRecord, m.id).ok;
+  });
+  picked.sort((a, b) => {
+    if (poolRank(a) !== poolRank(b)) return poolRank(a) - poolRank(b);
+    if (a.tier !== b.tier) return a.tier === 'free' ? -1 : 1;
+    return a.id.localeCompare(b.id);
+  });
+  return picked.slice(0, limit).map((m) => m.id);
+}
+
+/**
  * 把客户端传来的模型名解析成上游模型 id（用于分类和选号）。
  * 逻辑对齐 worker.js：精确命中优先，其次去掉 anthropic/ 前缀做后缀匹配，
  * Anthropic 协议下匹配不到时按 worker 的 DEFAULT_MODEL 处理。

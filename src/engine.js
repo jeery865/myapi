@@ -22,6 +22,7 @@ import {
   upstreamForModel,
   stripUpstreamPrefix,
   customModelList,
+  fallbackCandidates,
   DEFAULT_MODEL,
 } from './models.js';
 import { callOpencode, classifyOpencodeFailure, ANON_KEY } from './opencode.js';
@@ -40,6 +41,7 @@ import {
 import { usage, usageFromJson, createUsageSniffer } from './usage.js';
 import { appendChat } from './chatlog.js';
 import { readBody, randomId, createRateLimiter, createGate, clientIp } from './util.js';
+import { classifyRateLimit, withRecoverAt, isStatusLive } from './account-status.js';
 
 // 同时在处理的 /v1 请求数上限：每个请求都可能带几 MB body + 一条上游流
 const apiGate = createGate(config.maxInflightApi);
@@ -86,7 +88,17 @@ function rank(account, tier) {
   return 2;
 }
 
-/** 能用于该模型的账号（已排好优先级，不含"当前钉住哪个"的逻辑） */
+/** 终态：这两个状态的号直接从池子里剔掉（凭据已经救不回来了，复检也是白费） */
+const TERMINAL_STATES = new Set(['token_invalid', 'banned']);
+
+/**
+ * 能用于该模型的账号（已排好优先级，不含"当前钉住哪个"的逻辑）。
+ *
+ * 临时状态（throttled / rate_limited）**不剔除，但沉到最底**。之前它们是平等参与排序的，
+ * 于是钉住的那个号一旦撞了窗口限流，之后每个请求都要先在它身上白撞一次才能换号 ——
+ * 白吃一跳延迟加一次上游请求。降权之后：还有别的号就直接用，只剩它一个才回头用它。
+ * 而 recoverAt 一过它自动回到正常优先级 —— 不需要谁来手动点刷新。
+ */
 export function eligibleAccounts(modelId) {
   const tier = modelId ? tierOf(modelId) : 'free';
   // 上游必须对得上：opencode 的 key 塞进 freebuff 的 worker 里毫无意义，
@@ -95,11 +107,14 @@ export function eligibleAccounts(modelId) {
   const want = modelId ? providerForModel(modelId) : 'freebuff';
   const mine = store.accounts.filter((a) => providerOf(a) === want);
   const enabled = mine.filter((a) => a.enabled && a.token && a.token.length > 8);
-  const dead = new Set(['token_invalid', 'banned']);
-  const healthy = enabled.filter((a) => !dead.has(a.status?.state));
+  const healthy = enabled.filter((a) => !TERMINAL_STATES.has(a.status?.state));
   const base = healthy.length ? healthy : enabled; // 全被标记失效时仍然放行，让上游自己说话
   const usable = tier === 'paid' ? base.filter((a) => a.pool === 'any' || a.pool === 'paid') : base;
-  return [...usable].sort((a, b) => rank(a, tier) - rank(b, tier));
+  const now = Date.now();
+  return [...usable].sort((a, b) => {
+    const bad = (isStatusLive(a.status, now) ? 1 : 0) - (isStatusLive(b.status, now) ? 1 : 0);
+    return bad || rank(a, tier) - rank(b, tier);
+  });
 }
 
 /**
@@ -235,7 +250,13 @@ function classifyFailure(status, text) {
     if (/(create session failed:\s*401|invalid api key|token_invalid|unauthorized)/i.test(t)) return 'token_invalid';
     return 'blocked';
   }
-  if (status === 429 || /\b429\b|quota|rate.?limit|额度/i.test(t)) return 'rate_limited';
+  if (status === 429 || /\b429\b|quota|rate.?limit|额度/i.test(t)) {
+    // 429 有两种完全不同的含义，不能一刀切（见 src/account-status.js 开头）：
+    // 滚动窗口限流是分钟级、会自己好；当天额度耗尽要等重置。混为一谈会让
+    // "撞了一下 rpm"在控制台上看起来跟号废了一样。
+    // 传真实 status：非 429 但正文带限流词的，行为跟改动前一致（判额度用完）。
+    return classifyRateLimit(t, status);
+  }
   if (/create session failed:\s*401/i.test(t)) return 'token_invalid';
   return 'upstream_error';
 }
@@ -245,6 +266,7 @@ const FAILURE_TEXT = {
   token_invalid: 'token 失效',
   country_blocked: '地区受限',
   rate_limited: '额度用完',
+  throttled: '临时限流',
   no_credit: '余额不足',
   blocked: '上游拒绝',
   upstream_error: '上游失败',
@@ -262,6 +284,18 @@ function worthNextAccount(status, mode) {
   if (CLIENT_ERRORS.has(status)) return false;
   if (mode === 'onerror') return true;
   return status === 429 || status === 401 || status === 403 || status === 402 || (status >= 500 && status <= 599);
+}
+
+/**
+ * 这次失败值不值得**换个模型**再试。
+ *
+ * 只有"这个模型此刻打不通"这类才值得：滚动窗口限流、额度耗尽、出口 IP 打满、
+ * 当前模型的 session 被别的请求占着。token 失效 / 已封禁 / 地区受限 / 请求本身
+ * 写错了这些，换模型一样没用 —— 硬降级只会把用户的配额再烧一遍。
+ */
+function shouldFallback(last) {
+  if (!last) return false;
+  return ['throttled', 'rate_limited', 'ip_capped', 'model_locked'].includes(last.state);
 }
 
 // ───────────────────────────── Anthropic 协议补齐 ─────────────────────────────
@@ -566,7 +600,7 @@ async function dispatchApi(req, res, url) {
     }
   }
 
-  const makeRequest = () =>
+  const makeRequest = (modelOverride) =>
     new Request(`${url.origin || 'http://internal'}${pathname}${url.search}`, {
       method: req.method,
       headers: new Headers({
@@ -575,7 +609,15 @@ async function dispatchApi(req, res, url) {
         ...(req.headers['anthropic-version'] ? { 'anthropic-version': String(req.headers['anthropic-version']) } : {}),
         ...(req.headers['anthropic-beta'] ? { 'anthropic-beta': String(req.headers['anthropic-beta']) } : {}),
       }),
-      body: raw.length ? raw : null,
+      // 降级那一轮必须把 body 里的 model 换成真正要用的那个 —— worker 是从 body 里读
+      // 模型的，不改它等于没降级。没有覆盖时原样透传原始字节，不做无谓的 re-serialize
+      // （重排过的 JSON 虽然等价，但会改变 body 指纹，对排查没好处）。
+      body:
+        modelOverride && parsed && parsed.model !== modelOverride
+          ? JSON.stringify({ ...parsed, model: modelOverride })
+          : raw.length
+            ? raw
+            : null,
     });
 
   /**
@@ -592,54 +634,70 @@ async function dispatchApi(req, res, url) {
    * 再由 src/protocols 的适配器翻成那个上游要的格式。所以四种协议两两组合
    * 都不用单独写代码。opencode 的 gpt-* / gemini-* 也走这套适配器。
    */
-  const customUp = requestedModel ? upstreamForModel(requestedModel) : null;
-  // opencode 上这个模型的原生协议（chat / anthropic / responses / google）
-  const ocNative = requestedModel && isOpencodeModel(requestedModel) ? nativeProtocol(requestedModel) : null;
-  let bridge = null;
-  if (ocNative) {
-    if (isAnthropic && ocNative !== 'anthropic') bridge = 'a2c';
-    else if (!isAnthropic && ocNative === 'anthropic') bridge = 'c2a';
-  } else if (customUp && isAnthropic) {
-    // 客户端发的是 Anthropic，内部一律先归一到 chat
-    bridge = 'a2c';
-  }
-  // responses / google 这两种没有直接的 chat↔它 的桥，统一走 protocols 适配器：
-  // 先把请求归一成 chat，再由适配器翻过去（回来的响应同理）
-  const ocAdapter = ocNative === 'responses' || ocNative === 'google' ? adapterFor(ocNative) : null;
-  const callUpstream = (acct) => {
+  /**
+   * 一套完整的"用某个模型去打上游"的方案。
+   *
+   * 做成函数而不是几个 const，是因为模型降级要拿**另一个模型**把这些重算一遍 ——
+   * 上游归属、原生协议、桥接方向、适配器都可能随模型变。而下游的响应转换和流式转换
+   * 读的就是这几个变量，所以降级成功后就地更新它们（见下面 hit 之后的赋值）。
+   */
+  const planFor = (modelId) => {
+    const up = modelId ? upstreamForModel(modelId) : null;
+    // opencode 上这个模型的原生协议（chat / anthropic / responses / google）
+    const native = modelId && isOpencodeModel(modelId) ? nativeProtocol(modelId) : null;
+    let how = null;
+    if (native) {
+      if (isAnthropic && native !== 'anthropic') how = 'a2c';
+      else if (!isAnthropic && native === 'anthropic') how = 'c2a';
+    } else if (up && isAnthropic) {
+      // 客户端发的是 Anthropic，内部一律先归一到 chat
+      how = 'a2c';
+    }
+    // responses / google 这两种没有直接的 chat↔它 的桥，统一走 protocols 适配器：
+    // 先把请求归一成 chat，再由适配器翻过去（回来的响应同理）
+    const adapter = native === 'responses' || native === 'google' ? adapterFor(native) : null;
+    return { modelId, customUp: up, bridge: how, ocAdapter: adapter };
+  };
+  const plan = planFor(requestedModel);
+  // 这三个下游（响应转换 / 流式转换）要读，所以留在函数作用域里，降级成功后更新
+  let customUp = plan.customUp;
+  let bridge = plan.bridge;
+  let ocAdapter = plan.ocAdapter;
+
+  const callUpstream = (acct, p) => {
     const prov = providerOf(acct);
-    if (prov === 'freebuff') return worker.fetch(makeRequest(), buildEnv([acct.token], presented));
+    if (prov === 'freebuff') return worker.fetch(makeRequest(p.modelId), buildEnv([acct.token], presented));
     if (prov === 'opencode') {
       // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
-      const bare = stripPrefix(requestedModel || parsed?.model || '');
-      if (ocAdapter) {
+      const bare = stripPrefix(p.modelId || parsed?.model || '');
+      if (p.ocAdapter) {
         const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
-        const body = ocAdapter.requestFromChat(chatBody, bare);
+        const body = p.ocAdapter.requestFromChat(chatBody, bare);
         // Gemini 的 stream 标记在路径上不在 body 里，单独带过去
         if (chatBody.stream) body.__stream = true;
         return callOpencode({ pathname, method: req.method, body, req, token: acct.token, modelId: bare });
       }
       const body =
-        bridge === 'a2c'
+        p.bridge === 'a2c'
           ? anthropicToChat(parsed || {}, bare)
-          : bridge === 'c2a'
+          : p.bridge === 'c2a'
             ? chatToAnthropicRequest(parsed || {}, bare)
             : { ...(parsed || {}), model: bare };
       return callOpencode({ pathname, method: req.method, body, req, token: acct.token, modelId: bare });
     }
     // 自定义上游：账号的 provider 必须正好是这次模型所属的那个上游。
-    // 对不上就直接失败，**绝不能落到下面的 worker.fetch** —— 那等于把用户的
+    // 对不上就直接失败，**绝不能落到上面的 worker.fetch** —— 那等于把用户的
     // 第三方 API key 发给 freebuff 的引擎。理论上 eligibleAccounts 已经按上游筛过了，
     // 这里是第二道闸。
-    if (!customUp || prov !== customUp.id) {
-      const err = new Error(`账号 ${acct.id} 属于上游 ${prov}，和模型 ${requestedModel} 要求的上游对不上`);
+    if (!p.customUp || prov !== p.customUp.id) {
+      const err = new Error(`账号 ${acct.id} 属于上游 ${prov}，和模型 ${p.modelId} 要求的上游对不上`);
       err.mismatch = true;
       throw err;
     }
-    const bare = stripUpstreamPrefix(requestedModel, customUp);
+    const bare = stripUpstreamPrefix(p.modelId, p.customUp);
     // 归一到中枢格式，再交给适配器翻成上游协议
     const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
-    return callUpstreamApi(customUp, { chatBody, model: bare, apiKey: acct.token });
+    return callUpstreamApi(p.customUp, { chatBody, model: bare, apiKey: acct.token });
   };
 
   // 模型列表和 count_tokens 都不碰上游、不占额度，不需要账号
@@ -671,7 +729,9 @@ async function dispatchApi(req, res, url) {
     return;
   }
 
-  const { order, manual, mode, eligible } = selectOrder(requestedModel);
+  const primary = selectOrder(requestedModel);
+  const { manual, mode, eligible } = primary;
+  const order = primary.order;
   // opencode 的免费模型有一条不需要账号的路：官方 CLI 在没配 key 时用的 `public`
   // 匿名凭据。一个 opencode 号都没有时用它兜底，用户就能先把免费模型跑起来，
   // 不用非得先去注册。上游按出口 IP 限流，所以有真号的时候一定优先用真号。
@@ -707,61 +767,103 @@ async function dispatchApi(req, res, url) {
 
   store.touchKey(keyRecord.id);
 
-  let hit = null; // { acct, response }
+  // 客户端本来要的是哪个模型。降级之后 requestedModel 会被改写成实际用的那个，
+  // 所以这里先留一份原始值，用来判断"到底降级了没有"。
+  const clientModel = requestedModel;
+
+  // ── 模型降级 ──────────────────────────────────────────────────────────────
+  // settings.modelFallback 为 off（默认）时候选是空数组，下面就是原来的单轮逻辑。
+  // 开启后：原模型在所有账号上都撞限流/额度耗尽时，换一个模型把这次请求答完，
+  // 而不是把 429 甩给客户端 —— 用户那边看到的就是"没断"。
+  // 换号解决不了"所有账号在这个模型上都撞了"（限流是按模型计量的），换模型才行。
+  const fallbackIds = fallbackCandidates(requestedModel, keyRecord);
+  const roundModels = fallbackIds.length ? [requestedModel, ...fallbackIds] : [requestedModel];
+  const plansByModel = new Map(roundModels.map((id) => [id, id === requestedModel ? plan : planFor(id)]));
+
+  let hit = null; // { acct, response, plan }
   let last = null; // { status, text, acct, state }
   const tried = [];
   // 真正发出去了几次。tried 只记失败，所以成功/客户端错误那一次不在里面 ——
   // 但 x-myapi-accounts-tried 要的是"这次用了几个号"，得单独数
   let attempts = 0;
-  for (const acct of order) {
-    let resp;
-    attempts++;
-    try {
-      resp = await callUpstream(acct);
-    } catch (err) {
-      console.error(`[engine] 上游异常 ${pathname} (${acct.id}): ${err.message}`);
-      last = { status: 502, text: `上游异常: ${err.message}`, acct, state: 'upstream_error' };
-      tried.push(`${acct.id}:exception`);
-      if (manual) break;
-      continue;
+  let usedPlan = plan;
+
+  roundLoop: for (const roundModel of roundModels) {
+    const p = plansByModel.get(roundModel);
+    const isFallback = roundModel !== clientModel;
+    // 降级轮只试一个号：限流是按模型计的，换个模型本来就绕开了限流，
+    // 第一个号还打不通说明是这个模型整体不行，再换号只是浪费。
+    const roundOrder = isFallback ? selectOrder(roundModel).order.slice(0, 1) : order;
+    const roundManual = isFallback ? true : manual;
+    if (!roundOrder.length) continue;
+
+    for (const acct of roundOrder) {
+      let resp;
+      attempts++;
+      try {
+        resp = await callUpstream(acct, p);
+      } catch (err) {
+        console.error(`[engine] 上游异常 ${pathname} (${acct.id}): ${err.message}`);
+        last = { status: 502, text: `上游异常: ${err.message}`, acct, state: 'upstream_error' };
+        tried.push(`${acct.id}:exception`);
+        if (roundManual) break;
+        continue;
+      }
+      if (resp.status < 400 || CLIENT_ERRORS.has(resp.status)) {
+        hit = { acct, response: resp };
+        usedPlan = p;
+        break roundLoop;
+      }
+      const text = await resp.text().catch(() => '');
+      const prov = providerOf(acct);
+      const state =
+        prov === 'opencode'
+          ? classifyOpencodeFailure(resp.status, text)
+          : prov === 'freebuff'
+            ? classifyFailure(resp.status, text)
+            : classifyUpstreamFailure(resp.status, text);
+      // 记在**实际尝试的这个模型**上。降级轮的失败不该算到原模型头上。
+      recordModelResult(roundModel, { ok: false, status: resp.status, text });
+      // 匿名那条路不是真账号，别往库里写状态
+      if (!acct.anonymous) {
+        // withRecoverAt 会给"会自己好"的状态挂一个到期时间戳。控制台据此显示倒计时，
+        // 选号/健康计数据此在到期后自动放行 —— 这就是"不用手动刷新"的支点。
+        // 终态（token_invalid / banned）不加，免得看起来像会自己恢复。
+        store.setAccountStatus(acct.id, withRecoverAt({
+          state,
+          verdict: FAILURE_TEXT[state] || '上游失败',
+          detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
+          quota: acct.status?.quota || '',
+          source: 'request',
+        }, text, resp.status));
+      }
+      last = { status: resp.status, text, acct, state };
+      tried.push(`${acct.id}:${state}`);
+      if (roundManual || !worthNextAccount(resp.status, mode)) break;
     }
-    if (resp.status < 400 || CLIENT_ERRORS.has(resp.status)) {
-      hit = { acct, response: resp };
-      break;
-    }
-    const text = await resp.text().catch(() => '');
-    const prov = providerOf(acct);
-    const state =
-      prov === 'opencode'
-        ? classifyOpencodeFailure(resp.status, text)
-        : prov === 'freebuff'
-          ? classifyFailure(resp.status, text)
-          : classifyUpstreamFailure(resp.status, text);
-    recordModelResult(requestedModel, { ok: false, status: resp.status, text });
-    // 匿名那条路不是真账号，别往库里写状态
-    if (!acct.anonymous) {
-      store.setAccountStatus(acct.id, {
-        state,
-        verdict: FAILURE_TEXT[state] || '上游失败',
-        detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
-        quota: acct.status?.quota || '',
-        source: 'request',
-      });
-    }
-    last = { status: resp.status, text, acct, state };
-    tried.push(`${acct.id}:${state}`);
-    if (manual || !worthNextAccount(resp.status, mode)) break;
+
+    if (isFallback) continue; // 已经是降级轮了，还有候选就继续试下一个
+    // 原模型这一轮没打成。只有"换模型能解决"的失败才继续降级。
+    if (!shouldFallback(last) || !fallbackIds.length) break;
+    console.warn(
+      `[engine] ${pathname} 模型 ${clientModel} 全部账号失败（${last?.state}），降级重试：${fallbackIds.join(', ')}`
+    );
   }
 
   if (!hit) {
     // 对外只给归类结论，不回上游原文 —— 原文里可能带账号/内部细节，
     // 完整内容写进服务端日志和账号状态列
     const reason = last ? FAILURE_TEXT[last.state] || '上游失败' : '没有可用账号';
+    // 降级轮试过但也没成，得在错误里说清楚 —— 否则用户只知道"失败了"，
+    // 看到响应头里的 x-myapi-model-fallback 会一头雾水
+    const fellBack = usedPlan.modelId !== clientModel;
     const suffix = manual
       ? '（手动模式：不会自动换号，去控制台换一个账号或打开自动切换）'
       : order.length > 1
-        ? `（已依次试过 ${order.length} 个账号）`
-        : '';
+        ? `（已依次试过 ${order.length} 个账号${fellBack ? `，并降级到 ${usedPlan.modelId}` : ''}）`
+        : fellBack
+          ? `（已降级到 ${usedPlan.modelId}）`
+          : '';
     console.warn(
       `[engine] ${pathname} 全部账号失败：${tried.join(', ')}${last ? ` | 最后一条：HTTP ${last.status} ${String(last.text).slice(0, 300)}` : ''}`
     );
@@ -780,6 +882,16 @@ async function dispatchApi(req, res, url) {
   }
 
   const { acct: used, response } = hit;
+  // 降级成功了：把"实际用的模型"和它的方案就地改写。下面所有环节 —— 响应转换、
+  // 流式转换、usage 归属、recordModelResult、响应头 —— 读的都是这几个名字，
+  // 所以只要在这里换一次，整条链路就跟上了。
+  if (usedPlan.modelId !== requestedModel) {
+    console.warn(`[engine] ${pathname} 已降级：${clientModel} → ${usedPlan.modelId}（账号 ${used.id}）`);
+    requestedModel = usedPlan.modelId;
+    customUp = usedPlan.customUp;
+    bridge = usedPlan.bridge;
+    ocAdapter = usedPlan.ocAdapter;
+  }
   if (!used.anonymous) {
     // 只有"钉住一个号"那两种策略才需要记指针：
     //   single   是用户手动钉的，请求不该悄悄改掉
@@ -800,6 +912,11 @@ async function dispatchApi(req, res, url) {
   headers['x-myapi-provider'] = providerOf(used);
   if (attempts) headers['x-myapi-accounts-tried'] = String(attempts);
   if (requestedModel) headers['x-myapi-model-tier'] = tierOf(requestedModel);
+  // 降级是"悄悄换了模型"，必须留痕 —— 要么客户端自己按头判断，要么排查时能一眼看到
+  if (usedPlan.modelId !== clientModel) {
+    headers['x-myapi-model-fallback'] = `${clientModel}->${usedPlan.modelId}`;
+    headers['x-myapi-model'] = usedPlan.modelId;
+  }
   if (isAnthropic) headers['request-id'] = `req_${randomId(12)}`;
 
   const contentType = String(response.headers.get('content-type') || '');

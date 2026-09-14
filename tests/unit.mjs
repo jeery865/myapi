@@ -582,5 +582,110 @@ eq(
 );
 noteEngineModelList([]); // 复位，别影响后面的断言
 
+// ─────────────────────────────────────────────── 429 细分 / 状态生命周期 / 模型降级
+// 这一段围绕"撞到 rpm 不该被当成号废了"：判定要温和、坏状态要会自己过期、
+// 降级候选要守住授权。全是纯函数加一个内存 store，不起服务。
+const as = await import('../src/account-status.js');
+
+// parseRetryAfterMs：认得出上游给的等待时长；认不出就老实说"不知道"
+eq('{"retryAfterMs":N} → 原样取毫秒', as.parseRetryAfterMs('{"error":{"retryAfterMs":15506639}}', 429), 15506639);
+eq('retry-after: N → 秒换算成毫秒', as.parseRetryAfterMs('429 retry-after: 120', 429), 120000);
+eq('try again in 1h 2m 3s → 合成毫秒', as.parseRetryAfterMs('rate limited, try again in 1h 2m 3s', 429), (3600 + 120 + 3) * 1000);
+eq('try again in 45s → 45 秒', as.parseRetryAfterMs('try again in 45s', 429), 45000);
+eq('英文"每日额度"→ 抬到额度耗尽量级', as.parseRetryAfterMs('daily limit reached', 429), as.EXHAUSTED_THRESHOLD_MS);
+eq('中文"当日额度"同样识别', as.parseRetryAfterMs('当日额度已用完', 429), as.EXHAUSTED_THRESHOLD_MS);
+eq('正文没有时长 → null（null 是"不知道"，不是 0）', as.parseRetryAfterMs('too many requests', 429), null);
+eq('{"retryAfterMs":0} 不算有效提示', as.parseRetryAfterMs('{"retryAfterMs":0}', 429), null);
+
+// classifyRateLimit：默认温和 —— 拿不到证据就别吓人
+eq('短时 429 → 临时限流', as.classifyRateLimit('{"retryAfterMs":5000}', 429), 'throttled');
+eq('5 分钟的 429 → 仍按临时限流（滚动窗口量级）', as.classifyRateLimit('retry-after: 300', 429), 'throttled');
+eq('整小时的 429 → 额度用完', as.classifyRateLimit('retry-after: 3600', 429), 'rate_limited');
+eq('"每日"措辞 → 额度用完', as.classifyRateLimit('daily quota exceeded', 429), 'rate_limited');
+eq('裸 429、什么都没说 → 临时限流', as.classifyRateLimit('429 Too Many Requests', 429), 'throttled');
+eq('非 429 不参与细分（保持旧行为）', as.classifyRateLimit('quota exceeded', 402), 'rate_limited');
+
+// withRecoverAt：只有"会自己好"的状态才带到期时间
+const t0 = Date.now();
+const throttled = as.withRecoverAt({ state: 'throttled' }, '', 429);
+eq('临时限流带上 recoverAt', typeof throttled.recoverAt === 'string' && Date.parse(throttled.recoverAt) > t0, true);
+eq('临时限流默认冷却 1 分钟', throttled.cooldownMs, 60 * 1000);
+eq('额度耗尽默认冷却 30 分钟', as.withRecoverAt({ state: 'rate_limited' }, '', 429).cooldownMs, 30 * 60 * 1000);
+eq('有 retry 提示时冷却跟着提示走（5 分钟）', as.withRecoverAt({ state: 'throttled' }, 'retry-after: 300', 429).cooldownMs, 300 * 1000);
+eq('终态 token_invalid 不给 recoverAt', Object.hasOwn(as.withRecoverAt({ state: 'token_invalid' }, '', 401), 'recoverAt'), false);
+eq('banned 同理', Object.hasOwn(as.withRecoverAt({ state: 'banned' }, '', 403), 'recoverAt'), false);
+
+// isStatusLive：过期即自动恢复 —— 这就是"不用手动刷新"的核心
+eq('还没到期的坏状态算数', as.isStatusLive({ state: 'throttled', recoverAt: new Date(t0 + 60000).toISOString() }, t0), true);
+eq('已过期的坏状态不算数（=自动恢复）', as.isStatusLive({ state: 'throttled', recoverAt: new Date(t0 - 1).toISOString() }, t0), false);
+eq('没有 recoverAt 的终态永远算数', as.isStatusLive({ state: 'banned' }, t0), true);
+eq('ok 不算坏状态', as.isStatusLive({ state: 'ok' }, t0), false);
+eq('没状态的号不算坏', as.isStatusLive(null, t0), false);
+
+// needsRecheck：只挑"到点了、可能会好"的去花请求
+eq('到点的临时限流要复检', as.needsRecheck({ status: { state: 'throttled', recoverAt: new Date(t0 - 1000).toISOString() } }, t0), true);
+eq('还没到点的不急着重检', as.needsRecheck({ status: { state: 'throttled', recoverAt: new Date(t0 + 60000).toISOString() } }, t0), false);
+eq('终态不浪费请求复检', as.needsRecheck({ status: { state: 'token_invalid' } }, t0), false);
+eq('健康的号不复检', as.needsRecheck({ status: { state: 'ok' } }, t0), false);
+
+// 复检间隔读设置
+store.data.settings.accountRecheckMinutes = 0;
+eq('复检间隔填 0 → 关闭', as.recheckIntervalMs(), 0);
+store.data.settings.accountRecheckMinutes = 7;
+eq('复检间隔填 7 → 7 分钟', as.recheckIntervalMs(), 7 * 60 * 1000);
+store.data.settings.accountRecheckMinutes = -3;
+eq('复检间隔负数按关闭处理', as.recheckIntervalMs(), 0);
+
+// 设置写入要有白名单兜底，别因为拼错一个词就开始悄悄换模型
+eq('降级模式写非法值 → 退回 off', store.updateSettings({ modelFallback: 'yolo' }).modelFallback, 'off');
+eq('降级模式合法值能存', store.updateSettings({ modelFallback: 'tier' }).modelFallback, 'tier');
+store.updateSettings({ accountRecheckMinutes: 5 });
+eq('复检间隔超上限被拒（保留原值）', store.updateSettings({ accountRecheckMinutes: 99999 }).accountRecheckMinutes, 5);
+eq('复检间隔 0 合法（=关闭）', store.updateSettings({ accountRecheckMinutes: 0 }).accountRecheckMinutes, 0);
+
+// fallbackCandidates：限流时换模型顶上，但绝不越过授权
+const FB_FREE = 'deepseek/deepseek-v4-flash'; // freebuff free / standard 池
+const FB_PAID = 'deepseek/deepseek-v4-pro'; // freebuff paid / premium 池
+const keyFree = { allowPaid: false, models: [] };
+const keyPaid = { allowPaid: true, models: [] };
+store.data.settings.disabledModels = [];
+
+store.data.settings.modelFallback = 'off';
+eq('降级关闭时一个候选都不给', mdl.fallbackCandidates(FB_FREE, keyPaid).length, 0);
+
+store.data.settings.modelFallback = 'tier';
+const tierCands = mdl.fallbackCandidates(FB_FREE, keyPaid, { limit: 20 });
+eq('tier 模式候选非空', tierCands.length > 0, true);
+eq('tier 模式只给同档位（全 free）', tierCands.every((id) => mdl.tierOf(id) === 'free'), true);
+eq('tier 模式不换上游（全 freebuff）', tierCands.every((id) => mdl.providerForModel(id) === 'freebuff'), true);
+eq('tier 模式候选不含原模型', tierCands.includes(FB_FREE), false);
+eq('候选里不会混进 opencode 的号', tierCands.every((id) => !id.startsWith('opencode/')), true);
+
+store.data.settings.modelFallback = 'any';
+const anyCands = mdl.fallbackCandidates(FB_FREE, keyPaid, { limit: 20 });
+eq('any 模式会给出跨档位候选（含付费）', anyCands.some((id) => mdl.tierOf(id) === 'paid'), true);
+const anyFree = mdl.fallbackCandidates(FB_FREE, keyFree, { limit: 20 });
+eq('any 模式下免费 key 也拿不到付费候选', anyFree.every((id) => mdl.tierOf(id) === 'free'), true);
+eq('免费 key 在 any 模式下仍有免费备选（不会降级即断流）', anyFree.length > 0, true);
+eq('付费模型为基准时，tier 模式也守同档位', ((store.data.settings.modelFallback = 'tier'), mdl.fallbackCandidates(FB_PAID, keyPaid, { limit: 20 }).every((id) => mdl.tierOf(id) === 'paid')), true);
+
+store.data.settings.modelFallback = 'any';
+eq('候选数量受 limit 限制', mdl.fallbackCandidates(FB_FREE, keyPaid, { limit: 1 }).length, 1);
+
+// 未知 id 按 fail-closed 算付费：免费 key 不该因此拿到付费候选
+store.data.settings.modelFallback = 'tier';
+eq('未知模型当成付费：免费 key 一个候选都拿不到', mdl.fallbackCandidates('nope/nope', keyFree, { limit: 20 }).length, 0);
+
+// 下架名单与 key 白名单对降级同样生效 —— 降级不是绕过授权的后门
+store.data.settings.modelFallback = 'any';
+store.data.settings.disabledModels = ['mimo/mimo-v2.5'];
+eq('控制台下架的模型不会出现在降级候选里', mdl.fallbackCandidates(FB_FREE, keyPaid, { limit: 20 }).includes('mimo/mimo-v2.5'), false);
+store.data.settings.disabledModels = [];
+eq('key 的模型白名单卡住降级（只留白名单里的）', mdl.fallbackCandidates(FB_FREE, { allowPaid: true, models: ['mimo/mimo-v2.5'] }, { limit: 20 }), ['mimo/mimo-v2.5']);
+
+// 复位：这一段碰过设置，别把后面的东西带坏
+store.data.settings.modelFallback = 'off';
+store.data.settings.accountRecheckMinutes = 5;
+
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

@@ -461,6 +461,7 @@ a:hover { text-decoration: underline; }
 .setrow > .sv { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
 .setrow > .sv > code { font-size: 12.5px; color: var(--text); word-break: break-all; }
 .setrow > .sv > select { max-width: 340px; }
+.setrow > .sv > input[type="number"] { max-width: 150px; font-family: var(--mono); }
 .setrow > .sa { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 
 /* 说明文字：跟着控件走，不要额外的上下外边距把行撑开 */
@@ -658,7 +659,7 @@ a:hover { text-decoration: underline; }
 .btn.block { width: 100%; }
 
 /* ── 控件：输入 ── */
-input[type="text"], input[type="password"], input[type="search"], input[type="url"], select, textarea {
+input[type="text"], input[type="password"], input[type="search"], input[type="url"], input[type="number"], select, textarea {
   font: inherit;
   font-size: 12.5px;
   color: var(--text);
