@@ -19,7 +19,8 @@
 对外接口和原项目一致：`/v1/chat/completions`、`/v1/models`、`/v1/responses`、`/v1/messages`（Anthropic 协议）、`/healthz`。
 所有上游的模型合并成一张表对外给出去，非 freebuff 的 id 统一带上游名前缀（`opencode/mimo-v2.5-free`、`my-relay/gpt-4o`），不会和 freebuff 的 `厂商/模型` 撞车。网关内部一律以 OpenAI Chat Completions 为中枢格式，进出各翻一次 —— 所以**任意客户端协议都能打到任意上游协议**，比如用 Claude Code 去调一个只会说 Gemini 的中转。
 
-> 引擎文件 `vendor/worker.js` 原样引用上游（当前 **1.8.10.3**）、**一行没改**，方便随时 `npm run update-worker` 升级。所有新增能力都在 `src/` 这一层，控制台「模型」卡里会显示当前引擎版本。
+> 引擎文件 `vendor/worker.js` 引用上游（当前 **1.8.10.3**），方便随时 `npm run update-worker` 升级。所有新增能力都在 `src/` 这一层，控制台「模型」卡里会显示当前引擎版本。
+> 唯一一处例外是**下载后校正**：引擎里那份 `PAUSED_MODELS`（手写名单，命中就在引擎本地直接拒掉、请求发不到上游）会按官方 `FREEBUFF_PAUSED_FREE_MODEL_IDS` 重写一遍，把已经恢复上架的模型放开 —— 上游那份没有回收机制，`deepseek-v4-flash` 恢复后还在名单里待了一个月。校正**只有减法**、且拿不到官方名单时不动文件，实现见 `src/vendor-patch.js`；触发方式就是下面三种更新里的任意一种。
 > 跟随上游的更新有三种触发方式：① 应用启动后每 6 小时自己从官方常量刷一次模型分类（`src/models.js` 的 `refreshCatalog`，不需要重新部署）；② 仓库里的 GitHub Actions（`.github/workflows/update-vendor.yml`）每天跑一次 `npm run update-worker` 并把结果提交回仓库，Railway 跟着重新部署；③ 本地 `npm run update-worker`。
 > opencode Zen 和自定义上游都**不经过** `vendor/worker.js`：前者走 `src/opencode.js`，后者走 `src/protocols/` 里的适配器，都是直接发 HTTPS。
 

@@ -86,15 +86,20 @@ const called = await raw('/v1/chat/completions', {
 const text = await called.text();
 check('上游失败的错误里不含账号邮箱', !text.includes('sec@t.com'), text.slice(0, 200));
 check('试过的账号数只给数量', /^\d+$/.test(called.headers.get('x-myapi-accounts-tried') || ''), called.headers.get('x-myapi-accounts-tried'));
-// 随包引擎有一份本地硬编码的暂停名单，命中时它只回一句干巴巴的 unsupported_model。
-// 我们不改 vendor 文件，但要把这句话翻译清楚 —— 说明是引擎本地拒的，不是上游拒的。
-if (/unsupported_model/.test(text)) {
-  check(
-    '引擎本地拒模型时说清是本地拒的、给了下一步',
-    /vendor\/worker\.js/.test(text) && /update-worker/.test(text) && /不是上游拒的/.test(text),
-    text.slice(0, 200)
-  );
-}
+// 随包引擎有一份本地的暂停名单（vendor/worker.js 的 PAUSED_MODELS），命中时它只回
+// 一句干巴巴的 unsupported_model，请求根本发不到上游。名单由 npm run update-worker
+// 按官方 FREEBUFF_PAUSED_FREE_MODEL_IDS 校正，但用户手上的部署可能还没校正过。
+// （那句话本身的文案由单元测试盯着，见 tests/unit.mjs 的 enginePausedMessage 部分。）
+//
+// deepseek-v4-flash 被那份名单误拦了一个月（官方 2026-08-18 就恢复上架了，
+// 而且它还是 Muse Spark 的兜底模型），校正之后必须能走到上游。
+const flashProbe = await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }] }),
+});
+const flashText = await flashProbe.text();
+check('flash 不再被引擎本地误拦（已按官方名单校正）', !/unsupported_model/.test(flashText), flashText.slice(0, 200));
 
 // ── 跨站写请求 ──
 const csrf = await admin('/keys', 'POST', { name: 'x' }, { origin: 'https://evil.example' });

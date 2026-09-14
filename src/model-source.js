@@ -127,6 +127,56 @@ function parseRecordBlock(src, name, idMap) {
 }
 
 /**
+ * 官方「已撤下」名单：`FREEBUFF_PAUSED_FREE_MODEL_IDS`。
+ *
+ * 这是**唯一可靠的**「这个模型现在还算不算在售」判据。别拿上架池当判据 ——
+ * 官方撤下模型时会刻意保留它的 id 和 agent 映射（这样老客户端发来的请求能被
+ * 降级到默认模型、而不是收到一个它不认识的 id 然后无限重试，见上游 #1801），
+ * 所以撤下的模型照样出现在 free-agents.ts 里、照样被推导进 standard/premium 池。
+ * 只有这份名单会说「它已经被端走了」。
+ *
+ * 返回值区分两种情况，调用方必须区别对待：
+ *   null  = 没找到声明或解析不出（**别当成空名单**）
+ *   []    = 找到了、官方确实一个都没撤（很少见）
+ * 把 null 当成 [] 会让「按官方名单校正暂停状态」这类逻辑把还在撤下状态的模型
+ * 一起放开，那是静默换模型的开始。
+ */
+function parsePausedIds(src, idMap) {
+  const at = src.search(/export const FREEBUFF_PAUSED_FREE_MODEL_IDS\b/);
+  if (at < 0) return null;
+  // 注意别用 indexOf('[', at)：类型标注 `readonly string[]` 里就有一对方括号，
+  // 从那里切会得到一个空数组，看起来像「官方一个都没撤」。
+  const eq = src.indexOf('= [', at);
+  if (eq < 0) return null;
+  let depth = 0;
+  let end = -1;
+  for (let i = eq + 2; i < src.length; i++) {
+    if (src[i] === '[') depth++;
+    else if (src[i] === ']') {
+      depth--;
+      if (!depth) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return null;
+
+  const ids = [];
+  for (const raw of src.slice(eq + 2, end).split('\n')) {
+    const line = raw.replace(/\/\/.*$/, '').trim();
+    // 只认「一行一个常量名」这种形状；`...SPREAD` 之类看不懂的就跳过 ——
+    // 跳过意味着这个模型保持原样，不会因为解析能力不足被误放开
+    const m = line.match(/^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)?)\s*,?$/);
+    if (!m) continue;
+    const [name, member] = m[1].split('.');
+    const id = member ? KNOWN_MEMBERS[member] : idMap[name];
+    if (id) ids.push(id);
+  }
+  return [...new Set(ids)];
+}
+
+/**
  * 从官方常量拉一份模型表。
  * 拿不到 / 解析结果明显不对（模型太少、没有 premium 名单）就返回 null，让调用方回落。
  */
@@ -202,6 +252,8 @@ export async function fetchOfficialTable() {
     },
     limitedOffer: [...limitedOffer],
     deepseekFamily: [...deepseek],
+    // 官方已撤下的模型 id；null = 没解析出来（别当空数组用）
+    paused: parsePausedIds(src, idMap),
     generatedAt: new Date().toISOString(),
     source: 'official',
   };

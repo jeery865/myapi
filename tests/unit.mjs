@@ -687,5 +687,64 @@ eq('key 的模型白名单卡住降级（只留白名单里的）', mdl.fallback
 store.data.settings.modelFallback = 'off';
 store.data.settings.accountRecheckMinutes = 5;
 
+// ─────────────────────────────────────────────── 引擎暂停名单的"下载后校正"
+// 引擎 vendor/worker.js 里那份 PAUSED_MODELS 是上游手写的、没有回收机制：
+// deepseek-v4-flash 官方恢复上架后它还在拦，请求被引擎本地回掉、根本发不到上游。
+// 这里把校正函数和"仓库里那份已经校正过"这个不变量一起钉住。
+const { unpauseRecoveredModels } = await import('../src/vendor-patch.js');
+const SAMPLE = [
+  'const PAUSED_MODELS = new Set([',
+  '  "deepseek/deepseek-v4-flash",',
+  '  // 2026-08-20 官方下线 MiniMax M3（FREEBUFF_PAUSED_FREE_MODEL_IDS），',
+  '  // admission 返回 410 model_unavailable，新会话必然失败。',
+  '  "minimax/minimax-m3",',
+  ']);',
+  '',
+  'function isPausedModel(modelId) {',
+  '  return PAUSED_MODELS.has(modelId);',
+  '}',
+].join('\n');
+/** 从文本里把 PAUSED_MODELS 取出来真跑一遍 —— 光看字符串不算"还是合法 JS" */
+const pausedSetIn = (text) => {
+  const block = text.match(/const PAUSED_MODELS = new Set\(\[[\s\S]*?\]\);/)[0];
+  return [...new Function(`${block}\nreturn PAUSED_MODELS;`)()];
+};
+
+const official = ['minimax/minimax-m3'];
+const flat = unpauseRecoveredModels(SAMPLE, official);
+eq('官方已恢复的模型从引擎暂停名单里被摘掉', flat.changed, true);
+eq('摘掉的正是 flash', flat.removed, ['deepseek/deepseek-v4-flash']);
+eq('官方仍在撤下的模型保留在名单里', flat.text.includes('"minimax/minimax-m3"'), true);
+eq('恢复的模型不再出现在名单里', flat.text.includes('"deepseek/deepseek-v4-flash"'), false);
+eq('名单以外的代码原样保留', flat.text.includes('function isPausedModel'), true);
+eq('改完仍是合法 JS，且名单内容正确', pausedSetIn(flat.text), ['minimax/minimax-m3']);
+eq('对已校正过的文件不再重复改动（幂等）', unpauseRecoveredModels(flat.text, official).changed, false);
+
+// 安全性：没有官方名单时绝不能动手 —— 把 null 当空名单会把官方仍在撤下的模型
+// 一起放开，而撤下模型在上游那边是"静默降级到默认模型"，那是最难查的一类错
+eq('官方名单为 null → 不动作', unpauseRecoveredModels(SAMPLE, null), null);
+eq('官方名单为空数组 → 不动作', unpauseRecoveredModels(SAMPLE, []), null);
+eq('官方名单不是数组 → 不动作', unpauseRecoveredModels(SAMPLE, 'minimax/minimax-m3'), null);
+eq('源文本不是字符串 → 不动作', unpauseRecoveredModels(null, official), null);
+eq('找不到名单声明 → 不动作', unpauseRecoveredModels('const OTHER = 1;\n', official), null);
+
+// 用户看到的那句话：必须有"是引擎本地拒的"和"下一步做什么"两块信息。
+// 以前它只能靠集成测试碰巧走到，重构里丢一半也没人发现。
+const { enginePausedMessage } = await import('../src/vendor-patch.js');
+const msg = enginePausedMessage('deepseek/deepseek-v4-flash');
+eq('文案点名了是哪个模型', msg.includes('deepseek/deepseek-v4-flash'), true);
+eq('文案说清是引擎本地拒的、不是上游', msg.includes('vendor/worker.js') && msg.includes('不是上游拒的'), true);
+eq('文案给出下一步（跑更新）', msg.includes('npm run update-worker'), true);
+eq('文案给出官方判据名字', msg.includes('FREEBUFF_PAUSED_FREE_MODEL_IDS'), true);
+eq('文案解释了为什么宁可报错（上游会静默降级）', msg.includes('静默降级'), true);
+
+// 仓库里的 vendor/worker.js 必须已经是校正过的状态：防止有人用旧脚本把它盖回去，
+// 或者上游某次把 flash 又加回名单而没人注意
+const { readFileSync } = await import('node:fs');
+const { fileURLToPath } = await import('node:url');
+const shippedPaused = pausedSetIn(readFileSync(fileURLToPath(new URL('../vendor/worker.js', import.meta.url)), 'utf8'));
+eq('随包引擎里 flash 不再被误拦', shippedPaused.includes('deepseek/deepseek-v4-flash'), false);
+eq('随包引擎里官方仍在撤下的 m3 依然被拦', shippedPaused.includes('minimax/minimax-m3'), true);
+
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

@@ -2,12 +2,18 @@
 // 把 vendor/ 下的上游文件更新到最新（上游是单文件引擎，本项目不改它，只在外面套壳）。
 // 用法: npm run update-worker
 //
+// 例外：worker.js 下载后会做一处**校正**——把引擎里已经恢复上架的模型从它那份手写的
+// PAUSED_MODELS 摘掉（详见下方 unpauseRecovered）。上游那份名单没有回收机制，
+// 残留会把请求在引擎本地拦掉；只靠升级引擎修不好，因为上游自己也还带着这条。
+// 校正只有减法、且拿不到官方名单时不动文件。
+//
 // 每个目标都有多个镜像 + 重试 + 校验：以前只试一个地址、没超时也没重试，
 // 网络抖一下就报"更新失败"，然后你以为已经是最新了。
 import { writeFile, readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchOfficialTable } from '../src/model-source.js';
+import { unpauseRecoveredModels } from '../src/vendor-patch.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO = 'pingmike2/freebuff2api-wokers';
@@ -26,6 +32,7 @@ const TARGETS = [
       return null;
     },
     describe: (text) => (text.match(/const VERSION = "([^"]+)"/) || [])[1] || '?',
+    finalize: unpauseRecovered,
   },
   {
     file: 'vendor/freebuff-models.json',
@@ -47,7 +54,10 @@ const TARGETS = [
       return null;
     },
     describe: (text) => JSON.parse(text).generatedAt || '?',
-    finalize: repairPools,
+    finalize: async (text, before) => {
+      const repaired = await repairPools(text);
+      return keepFresher(repaired, before) ?? repaired;
+    },
   },
 ];
 
@@ -109,6 +119,76 @@ async function repairPools(text) {
   return JSON.stringify(json, null, 2) + '\n';
 }
 
+/**
+ * vendor/worker.js 下载后的校正：把引擎里**已经恢复上架**的模型从它那份手写的
+ * PAUSED_MODELS 里摘掉。
+ *
+ * 起因：引擎的暂停名单是上游手写的，没有回收机制。deepseek/deepseek-v4-flash 在
+ * 官方恢复（availability=always、premium=false、standard 池、还被指定为 Muse Spark
+ * 的兜底模型）之后，引擎里那条 2026-08-18 的残留还在拦它 —— 请求被引擎本地回掉，
+ * 根本发不到上游。而只靠「升级引擎」修不好：上游 main 的 VERSION 同样是 1.8.10.3、
+ * 名单一字不差，拉回来还是拦。
+ *
+ * 所以这里按官方权威名单 FREEBUFF_PAUSED_FREE_MODEL_IDS 校正一次。规则只有减法，
+ * 且**拿不到官方名单就原样返回** —— 没有证据时不动 vendor 文件，这条必须守住。
+ * 输出必须确定性（不打时间戳），否则每次跑都会和文件内容不等、"已是最新"永远不成立。
+ */
+async function unpauseRecovered(text, before = '') {
+  let official = null;
+  try {
+    official = await fetchOfficialTable();
+  } catch (err) {
+    console.warn(`! 官方常量拉取失败，引擎暂停名单这次不校正：${err.message}`);
+    return text;
+  }
+  const result = unpauseRecoveredModels(text, official?.paused);
+  if (!result) {
+    console.warn('! 没能定位引擎的 PAUSED_MODELS，跳过校正（vendor 按原样写入）');
+    return text;
+  }
+  if (!result.changed) {
+    console.log('  · 引擎暂停名单已与官方一致，无需校正');
+    return text;
+  }
+  // 每次下载回来的都是上游那份（flash 还在里面），所以"要不要放开"每次都会成立；
+  // 只有最终内容确实和本地不同才值得说一句，否则日志会让人以为改了什么。
+  if (before === result.text) {
+    console.log('  · 引擎暂停名单需要校正，结果与本地一致（无需改动）');
+    return result.text;
+  }
+  console.log(`  · 已放开引擎误拦的模型：${result.removed.join('、')}`);
+  return result.text;
+}
+
+/**
+ * 别让「更新」变成「降级」。
+ *
+ * 模型表有三个源，顺序是 release 资产 → raw → jsdelivr。release 资产最新，但它在
+ * github.com 上、本机未必连得通（实测这台机器直接 fetch failed），一失败就回落到
+ * raw 里的**仓库快照** —— 那份可能落后几周，比仓库里现有的还旧。
+ *
+ * 2026-09-14 实测到过一次：模型表被从 9-14 倒回 8-11，丢掉 z-ai/glm-5.3-flash 等
+ * 3 个在售模型，premium 底表从 11 项掉到 7 项 —— 那份底表是「只收紧」的保险，
+ * 缺项等于对某些付费模型 fail-open。所以比一下 generatedAt：远端更旧就保留本地。
+ * 拿不到日期就不判定（不能因为一方没写日期就拒绝一次正常的更新）。
+ */
+function keepFresher(remote, local) {
+  const at = (t) => {
+    try {
+      return Date.parse(JSON.parse(t).generatedAt) || 0;
+    } catch {
+      return 0;
+    }
+  };
+  const r = at(remote);
+  const l = at(local);
+  if (!r || !l || r >= l) return null;
+  console.warn(`! 远端模型表比本地旧（${new Date(r).toISOString()} < ${new Date(l).toISOString()}）`);
+  console.warn('  保留本地这份，不降级 —— 回落到 raw 的仓库快照时会这样，那份可能落后几周。');
+  console.warn('  （下面那句「已是最新」指的就是保留了本地这份）');
+  return local;
+}
+
 async function grab(url, timeoutMs = 20000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -154,11 +234,12 @@ for (const target of TARGETS) {
     failed++;
     continue;
   }
-  // 上游内容到手之后、比对和落盘之前做收尾（目前只有模型表需要补额度池）。
-  // 收尾必须是确定性的，否则"已是最新"这个判断会永远不成立。
+  // 上游内容到手之后、比对和落盘之前做收尾（模型表补额度池 + 拒绝降级、
+  // worker.js 校正暂停名单）。收尾必须是确定性的，否则「已是最新」永远不成立。
+  // before 也传进去：有的收尾需要对照本地现有版本才能判断该不该用远端这份。
   if (target.finalize) {
     try {
-      const finalized = await target.finalize(text);
+      const finalized = await target.finalize(text, before);
       if (finalized) text = finalized;
     } catch (err) {
       console.warn(`! ${target.file} 收尾处理失败，保持原样写入：${err.message}`);

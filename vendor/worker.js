@@ -366,9 +366,11 @@ const STANDARD_MODELS = new Set([
 // 需要扩展暂停名单时改这里（或后续接 env PAUSED_MODELS 覆盖）。
 // ---------------------------------------------------------------------------
 const PAUSED_MODELS = new Set([
-  "deepseek/deepseek-v4-flash",
-  // 2026-08-20 官方下线 MiniMax M3（FREEBUFF_PAUSED_FREE_MODEL_IDS），
-  // admission 返回 410 model_unavailable，新会话必然失败。
+  // ── 本段在每次 npm run update-worker 时按官方 FREEBUFF_PAUSED_FREE_MODEL_IDS
+  //    校正（见 src/vendor-patch.js）。上游那份是手写名单、没有回收机制：
+  //    模型恢复上架后条目会一直留着，请求会被引擎本地拦掉、根本发不到上游
+  //    （deepseek-v4-flash 就这么被误拦了一个月）。这里只做减法 —— 官方说
+  //    「已不撤下」的才放开，不会替上游新增暂停项。官方名单拉不到时本段不动。
   "minimax/minimax-m3",
 ]);
 
