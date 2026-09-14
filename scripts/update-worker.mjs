@@ -2,10 +2,11 @@
 // 把 vendor/ 下的上游文件更新到最新（上游是单文件引擎，本项目不改它，只在外面套壳）。
 // 用法: npm run update-worker
 //
-// 例外：worker.js 下载后会做一处**校正**——把引擎里已经恢复上架的模型从它那份手写的
-// PAUSED_MODELS 摘掉（详见下方 unpauseRecovered）。上游那份名单没有回收机制，
-// 残留会把请求在引擎本地拦掉；只靠升级引擎修不好，因为上游自己也还带着这条。
-// 校正只有减法、且拿不到官方名单时不动文件。
+// 例外：worker.js 下载后会做一处**校正**——把引擎那份手写的 PAUSED_MODELS 按官方
+// FREEBUFF_PAUSED_FREE_MODEL_IDS 整体对齐（详见下方 syncPaused）。上游那份名单没有
+// 回收机制：恢复上架的条目会一直留着、把请求在引擎本地拦掉，而新撤下的又不会补进来。
+// 只靠升级引擎修不好，因为上游自己也还带着那条残留。
+// 对齐是双向的（放开 + 拦住），且拿不到官方名单时不动文件。
 //
 // 每个目标都有多个镜像 + 重试 + 校验：以前只试一个地址、没超时也没重试，
 // 网络抖一下就报"更新失败"，然后你以为已经是最新了。
@@ -13,7 +14,7 @@ import { writeFile, readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchOfficialTable } from '../src/model-source.js';
-import { unpauseRecoveredModels } from '../src/vendor-patch.js';
+import { syncPausedModels } from '../src/vendor-patch.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO = 'pingmike2/freebuff2api-wokers';
@@ -32,7 +33,7 @@ const TARGETS = [
       return null;
     },
     describe: (text) => (text.match(/const VERSION = "([^"]+)"/) || [])[1] || '?',
-    finalize: unpauseRecovered,
+    finalize: syncPaused,
   },
   {
     file: 'vendor/freebuff-models.json',
@@ -120,8 +121,8 @@ async function repairPools(text) {
 }
 
 /**
- * vendor/worker.js 下载后的校正：把引擎里**已经恢复上架**的模型从它那份手写的
- * PAUSED_MODELS 里摘掉。
+ * vendor/worker.js 下载后的校正：把引擎那份手写的 PAUSED_MODELS 按官方权威名单
+ * FREEBUFF_PAUSED_FREE_MODEL_IDS **整体对齐** —— 恢复上架的放开、新撤下的拦住。
  *
  * 起因：引擎的暂停名单是上游手写的，没有回收机制。deepseek/deepseek-v4-flash 在
  * 官方恢复（availability=always、premium=false、standard 池、还被指定为 Muse Spark
@@ -129,11 +130,12 @@ async function repairPools(text) {
  * 根本发不到上游。而只靠「升级引擎」修不好：上游 main 的 VERSION 同样是 1.8.10.3、
  * 名单一字不差，拉回来还是拦。
  *
- * 所以这里按官方权威名单 FREEBUFF_PAUSED_FREE_MODEL_IDS 校正一次。规则只有减法，
- * 且**拿不到官方名单就原样返回** —— 没有证据时不动 vendor 文件，这条必须守住。
+ * 为什么双向（早先只做减法）：官方撤下的模型上游是**静默降级到默认模型**、不报错，
+ * 与其让用户以为在用 A 其实拿的是 B，不如跟着官方名单明确拦住。
+ * 唯一铁律：**拿不到官方名单就原样返回** —— 没有证据时不动 vendor 文件。
  * 输出必须确定性（不打时间戳），否则每次跑都会和文件内容不等、"已是最新"永远不成立。
  */
-async function unpauseRecovered(text, before = '') {
+async function syncPaused(text, before = '') {
   let official = null;
   try {
     official = await fetchOfficialTable();
@@ -141,9 +143,9 @@ async function unpauseRecovered(text, before = '') {
     console.warn(`! 官方常量拉取失败，引擎暂停名单这次不校正：${err.message}`);
     return text;
   }
-  const result = unpauseRecoveredModels(text, official?.paused);
+  const result = syncPausedModels(text, official?.paused);
   if (!result) {
-    console.warn('! 没能定位引擎的 PAUSED_MODELS，跳过校正（vendor 按原样写入）');
+    console.warn('! 没能定位引擎的 PAUSED_MODELS（或官方名单没解析出来），跳过校正（vendor 按原样写入）');
     return text;
   }
   if (!result.changed) {
@@ -152,11 +154,15 @@ async function unpauseRecovered(text, before = '') {
   }
   // 每次下载回来的都是上游那份（flash 还在里面），所以"要不要放开"每次都会成立；
   // 只有最终内容确实和本地不同才值得说一句，否则日志会让人以为改了什么。
+  const what = [
+    result.removed.length ? `放开 ${result.removed.join('、')}` : '',
+    result.added.length ? `拦住 ${result.added.join('、')}` : '',
+  ].filter(Boolean).join('；');
   if (before === result.text) {
-    console.log('  · 引擎暂停名单需要校正，结果与本地一致（无需改动）');
+    console.log(`  · 引擎暂停名单需按官方校正（${what}），结果与本地一致（无需改动）`);
     return result.text;
   }
-  console.log(`  · 已放开引擎误拦的模型：${result.removed.join('、')}`);
+  console.log(`  · 引擎暂停名单已按官方对齐：${what}`);
   return result.text;
 }
 

@@ -225,6 +225,12 @@ function normalize(raw, source) {
     limits: { premium: 4, standard: 6, deepseek: 0, ...(raw?.limits || {}) },
     limitedOffer: new Set(raw?.limitedOffer || []),
     deepseekFamily: new Set(raw?.deepseekFamily || []),
+    // 官方「已撤下」名单（FREEBUFF_PAUSED_FREE_MODEL_IDS，只有官方常量源会给）。
+    // raw.paused 是数组 → 我们**确实知道**官方名单（空数组 = 官方一个都没撤）；
+    // 缺失或 null（第三方 JSON、或官方源这次没解析出来）→ 不知道，此时一律不拦，
+    // 绝不能把"不知道"当成"什么都没撤"之外的任何解释。见 pausedKnown。
+    paused: new Set(Array.isArray(raw?.paused) ? raw.paused : []),
+    pausedKnown: Array.isArray(raw?.paused),
   };
 }
 
@@ -431,6 +437,47 @@ export function isEnginePaused(modelId) {
   return enginePaused.has(modelId);
 }
 
+// ───────────────────────── 官方「已撤下」名单
+//
+// 官方常量 FREEBUFF_PAUSED_FREE_MODEL_IDS 是**唯一权威**的「这个模型现在还算不算在售」
+// 判据（理由见 model-source.js 的 parsePausedIds）。它由 refreshCatalog 带着官方常量源
+// 一起拉，每 6 小时自动刷一次 —— 所以官方今天撤下、明天恢复，这里都会自动跟上，
+// **不需要重新部署、也不需要手动跑任何脚本**。
+//
+// 为什么这里要真的拦，而不是像 enginePaused 那样只做提示：官方撤下模型后，上游服务端
+// 不报错，而是**静默降级到默认模型** —— 客户端以为在用 A，其实拿回来的是 B 的回答。
+// 那种沉默比一句明确的错误危险得多，所以宁可明确拦下并说清原因。
+// 但只在 pausedKnown（官方名单确实解析出来了）时才拦；解析不到就照常转发，绝不乱拦。
+export function officialPausedKnown() {
+  return Boolean(table.pausedKnown);
+}
+
+export function isPausedByOfficial(modelId) {
+  return Boolean(table.pausedKnown && modelId && table.paused.has(modelId));
+}
+
+/** 被官方撤下时给用户看的说明。放在这里，让控制台和 API 用同一份措辞。 */
+export function officialPausedMessage(modelId) {
+  return (
+    `模型 ${modelId} 已被官方撤下（FREEBUFF_PAUSED_FREE_MODEL_IDS）。` +
+    `上游对撤下的模型不会报错，而是**静默降级到默认模型** —— 直接放过去会让你以为在用 ${modelId}、` +
+    `实际拿回来的是别的模型的回答，所以这里如实拦下。` +
+    `这份名单随模型表每 6 小时自动刷新：官方恢复上架后它会自动变回可用，不需要改配置。`
+  );
+}
+
+/**
+ * 仅供单测：用一份「官方风格的原始表」替换当前表。
+ *
+ * 单测是离线的，拉不到官方常量源，也就没法让 refreshCatalog() 真的跑一遍；
+ * 但「官方名单 → 拦不拦」这条链路必须被钉住（它是"自动跟随官方"的核心）。
+ * 所以留一个显式的注入口，生产代码绝不调用它。
+ */
+export function __installCatalogForTest(raw, source = 'official') {
+  table = normalize(raw, source);
+  return table;
+}
+
 export function availabilityOf(modelId) {
   if (isOpencodeModel(modelId)) {
     const entry = opencodeEntry(modelId);
@@ -441,6 +488,10 @@ export function availabilityOf(modelId) {
     const st = store.modelStatus?.[modelId];
     if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
     return { state: 'listed', detail: 'opencode Zen 上游列表里有它（还没实测过）', at: null };
+  }
+  // 官方已撤下：这是硬事实，优先于下面"引擎列表里没有它"那种软提示
+  if (isPausedByOfficial(modelId)) {
+    return { state: 'withdrawn', detail: officialPausedMessage(modelId), at: null };
   }
   // "引擎列表里没有它" 只作为提示，不代表不能用：额度每天刷新、付费能解锁，
   // 所以照常放行，真调不通的时候上游会自己说
@@ -522,6 +573,8 @@ export function catalogMeta() {
     lastRefresh,
     count: table.models.size,
     limits: table.limits || null,
+    // 官方「已撤下」名单的状态：known=false 说明这次没解析到（此时不拦任何模型）
+    paused: { known: Boolean(table.pausedKnown), count: table.paused.size, ids: [...table.paused] },
     opencode: { count: ocTable.size, lastRefresh: ocLastRefresh },
     custom: { count: customCatalog().length },
   };
@@ -546,6 +599,7 @@ export function defaultModel({ hasFreebuff = true } = {}) {
         tierOf(id) === 'free' &&
         !isLimitedOffer(id) && // 限量试用随时会整个消失，不能当默认
         !enginePaused.has(id) &&
+        !isPausedByOfficial(id) && // 官方撤下的当然不能当默认
         availabilityOf(id).state !== 'unavailable'
     )
     .sort();
@@ -600,6 +654,16 @@ export function checkModelAccess(keyRecord, modelId) {
   if (idle) {
     return { ok: false, status: 503, message: `上游「${idle.name}」已停用，去控制台重新启用或换一个模型` };
   }
+  // 官方已撤下（FREEBUFF_PAUSED_FREE_MODEL_IDS）：和下面"引擎列表里没有它"那条软提示
+  // 不是一回事 —— 这是**官方权威名单**里明确写着撤下的，而上游对撤下的模型是静默降级到
+  // 默认模型（不报错）。放过去等于让用户以为在用 A、实际拿回 B 的回答，所以这里明确拦下。
+  // 名单随模型表每 6 小时自动刷新，官方恢复上架后这里会自动放行 —— 无需任何人工步骤。
+  // 状态与 type 故意和引擎自己的 PAUSED_MODELS 行为一致（400 + unsupported_model），
+  // 这样客户端看到的错误信封和以前完全一样，只是原因写清楚了。
+  // 只在 pausedKnown（官方名单确实解析出来了）时才拦；解析不到就照常转发，绝不乱拦。
+  if (isPausedByOfficial(modelId)) {
+    return { ok: false, status: 400, message: officialPausedMessage(modelId), type: 'unsupported_model' };
+  }
   // 注意：这里**不再**因为"引擎的模型列表里没有它"就拦掉。
   // 额度每天刷新、付费能解锁，上游自己都没拦，中转没有资格比上游更严。
   // 真的不可用时，上游会回它自己的错误，那条错误比我们猜的准。
@@ -652,6 +716,9 @@ export function fallbackCandidates(modelId, keyRecord, { limit = 3 } = {}) {
     if (mode === 'tier' && m.tier !== baseTier) return false;
     if (!m.enabled) return false;
     if (availabilityOf(m.id).state === 'unavailable') return false;
+    // 官方已撤下的也不能当降级目标：上游那边它是"静默降级到默认模型"，
+    // 拿它当落点等于把一个静默换模型的行为伪装成"降级成功"
+    if (isPausedByOfficial(m.id)) return false;
     return checkModelAccess(keyRecord, m.id).ok;
   });
   picked.sort((a, b) => {
@@ -717,6 +784,9 @@ export function filterModelList(keyRecord, list) {
     }
     // 前缀属于某个停用上游 → 不对外提供（这是用户自己在控制台关的）
     if (idleUpstreamFor(id)) return false;
+    // 官方已撤下：/v1/models 是"现在真能用的列表"，撤下的不该出现在里面
+    // （控制台目录 catalog() 仍然会列出它并标 withdrawn，不会悄悄消失）
+    if (hideDead && isPausedByOfficial(id)) return false;
     // 注意：**不再**因为"引擎列表里没有它"就藏掉。额度每天刷新、付费能解锁，
     // 藏掉等于替用户做决定。只有连续实测失败（unavailable）才藏，且可在设置里关。
     if (hideDead && availabilityOf(id).state === 'unavailable') return false;

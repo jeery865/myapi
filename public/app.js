@@ -1235,7 +1235,8 @@ let modelFilter = 'all';
 
 // 「有问题」这一档：只放**确实调不通**的。
 // "引擎列表里没有它"（absent）不算 —— 额度每天刷新、付费能解锁，那只是个提示。
-const DEAD_STATES = ['unavailable', 'region_locked'];
+// withdrawn = 官方名单明确撤下（FREEBUFF_PAUSED_FREE_MODEL_IDS），那是硬事实，算。
+const DEAD_STATES = ['unavailable', 'region_locked', 'withdrawn'];
 
 const AVAIL_LABEL = {
   ok: ['ok', '实测可用'],
@@ -1245,6 +1246,7 @@ const AVAIL_LABEL = {
   unavailable: ['bad', '实测不可用'],
   absent: ['warn', '未列出 · 仍可试'],
   region_locked: ['warn', '当前地区不可用'],
+  withdrawn: ['bad', '官方已撤下'],
   unverified: ['', '未验证'],
 };
 
@@ -1326,9 +1328,15 @@ function renderModels(s) {
   $('#m-source').textContent = SOURCE_LABEL[meta.source] || meta.source || '—';
   const lim = meta.limits || {};
   $('#m-limits').textContent = `Premium ${lim.premium ?? '?'} 次/天 · DeepSeek 家族另限 ${lim.deepseek ?? '?'} 次/天 · 非 Premium ${lim.standard ?? '?'}（CLI 协议下不限量）`;
-  $('#m-source-note').textContent = meta.generatedAt
-    ? `表生成时间 ${new Date(meta.generatedAt).toLocaleString('zh-CN', { hour12: false })}，共 ${meta.count} 个模型。分类只跟着上游额度池走，不是"要不要花钱"。`
-    : '';
+  // 官方「已撤下」名单是自动跟的：随模型表每 6 小时刷一次，所以这里如实报当前状态
+  const paused = meta.paused || {};
+  const pausedNote = paused.known
+    ? ` 官方「已撤下」名单已同步（${paused.count ? paused.ids.join('、') : '当前没有撤下的模型'}），每 6 小时自动刷新一次，无需手动操作。`
+    : ' 官方「已撤下」名单这次没解析到（这一轮不拦任何模型，下次刷新会重试）。';
+  $('#m-source-note').textContent =
+    (meta.generatedAt
+      ? `表生成时间 ${new Date(meta.generatedAt).toLocaleString('zh-CN', { hour12: false })}，共 ${meta.count} 个模型。分类只跟着上游额度池走，不是"要不要花钱"。`
+      : '') + pausedNote;
   $('#set-hidedead').checked = s.settings.hideUnavailableModels !== false;
   const sel = $('#set-defaultmodel');
   const cur = s.settings.defaultModel || '';

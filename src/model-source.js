@@ -136,10 +136,11 @@ function parseRecordBlock(src, name, idMap) {
  * 只有这份名单会说「它已经被端走了」。
  *
  * 返回值区分两种情况，调用方必须区别对待：
- *   null  = 没找到声明或解析不出（**别当成空名单**）
- *   []    = 找到了、官方确实一个都没撤（很少见）
- * 把 null 当成 [] 会让「按官方名单校正暂停状态」这类逻辑把还在撤下状态的模型
- * 一起放开，那是静默换模型的开始。
+ *   null  = 没找到声明 / 解析不出（**别当成空名单**）
+ *   []    = 找到了、而且确实一条都没有
+ * 把 null 当成 [] 会让「按官方名单同步暂停状态」这类逻辑把还在撤下状态的模型
+ * 一起放开，那是静默换模型的开始。所以这里对"名单里有内容但一条也没解析出来"
+ * （上游换了写法、或者全是展开表达式）也返回 null —— 看不懂就别动。
  */
 function parsePausedIds(src, idMap) {
   const at = src.search(/export const FREEBUFF_PAUSED_FREE_MODEL_IDS\b/);
@@ -163,9 +164,12 @@ function parsePausedIds(src, idMap) {
   if (end < 0) return null;
 
   const ids = [];
+  let entries = 0;
   for (const raw of src.slice(eq + 2, end).split('\n')) {
     const line = raw.replace(/\/\/.*$/, '').trim();
-    // 只认「一行一个常量名」这种形状；`...SPREAD` 之类看不懂的就跳过 ——
+    if (!line) continue; // 纯注释行 / 空行
+    entries++;
+    // 只认「一行一个常量名」这种形状；`...SPREAD` 之类看不懂的跳过 ——
     // 跳过意味着这个模型保持原样，不会因为解析能力不足被误放开
     const m = line.match(/^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)?)\s*,?$/);
     if (!m) continue;
@@ -173,6 +177,9 @@ function parsePausedIds(src, idMap) {
     const id = member ? KNOWN_MEMBERS[member] : idMap[name];
     if (id) ids.push(id);
   }
+  // 名单里有条目、却一条都没解析出来 = 上游改了写法。返回 null（看不懂就别动），
+  // 绝不能返回 [] —— 那等于宣称"官方什么都没撤"，会把所有暂停限制一起放开。
+  if (entries > 0 && ids.length === 0) return null;
   return [...new Set(ids)];
 }
 

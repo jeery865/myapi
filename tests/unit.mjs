@@ -82,6 +82,12 @@ const { selectOrder, createAnthropicStreamPatcher, ensureMessageId, normalizeAnt
 const FREE = 'deepseek/deepseek-v4-flash';
 const PAID = 'openai/gpt-5.6-luna';
 
+// 这一段考的是「老的全局 autoSwitch 开关被翻译成新的 per-upstream 策略」这条路径
+// （见 src/upstreams.js 的 legacyMode）。而 store.load() 读的是**真实数据文件**，
+// 里面可能留着上一次跑测试时写下的 rotationRules（上面的上游那一段会用
+// setRotationRule 写盘）。不清掉的话，第二次运行时 freebuff 已经有 mode 了，
+// autoSwitch 就被完全忽略，下面两条断言必挂 —— 这是测试彼此污染，不是产品问题。
+store.data.settings.rotationRules = {};
 store.data.settings.autoSwitch = true;
 store.data.settings.activeAccountId = null;
 eq('没钉号时按优先级排（仅免费的号先接免费模型）', selectOrder(FREE).order.map((a) => a.id), ['a3', 'a1', 'a2']);
@@ -690,8 +696,10 @@ store.data.settings.accountRecheckMinutes = 5;
 // ─────────────────────────────────────────────── 引擎暂停名单的"下载后校正"
 // 引擎 vendor/worker.js 里那份 PAUSED_MODELS 是上游手写的、没有回收机制：
 // deepseek-v4-flash 官方恢复上架后它还在拦，请求被引擎本地回掉、根本发不到上游。
-// 这里把校正函数和"仓库里那份已经校正过"这个不变量一起钉住。
-const { unpauseRecoveredModels } = await import('../src/vendor-patch.js');
+// 这里把对齐函数和"仓库里那份已经对齐过"这个不变量一起钉住。
+// 对齐是**双向**的：官方恢复上架的放开（旧行为），官方新撤下的拦住（新增）——
+// 后者是因为撤下的模型上游会静默降级到默认模型，放过去等于让用户以为在用 A 拿到 B。
+const { syncPausedModels } = await import('../src/vendor-patch.js');
 const SAMPLE = [
   'const PAUSED_MODELS = new Set([',
   '  "deepseek/deepseek-v4-flash",',
@@ -710,23 +718,42 @@ const pausedSetIn = (text) => {
   return [...new Function(`${block}\nreturn PAUSED_MODELS;`)()];
 };
 
-const official = ['minimax/minimax-m3'];
-const flat = unpauseRecoveredModels(SAMPLE, official);
+const official = ['minimax/minimax-m3', 'z-ai/glm-5.2'];
+const flat = syncPausedModels(SAMPLE, official);
 eq('官方已恢复的模型从引擎暂停名单里被摘掉', flat.changed, true);
 eq('摘掉的正是 flash', flat.removed, ['deepseek/deepseek-v4-flash']);
+eq('官方新撤下的模型被补进名单', flat.added, ['z-ai/glm-5.2']);
 eq('官方仍在撤下的模型保留在名单里', flat.text.includes('"minimax/minimax-m3"'), true);
 eq('恢复的模型不再出现在名单里', flat.text.includes('"deepseek/deepseek-v4-flash"'), false);
 eq('名单以外的代码原样保留', flat.text.includes('function isPausedModel'), true);
-eq('改完仍是合法 JS，且名单内容正确', pausedSetIn(flat.text), ['minimax/minimax-m3']);
-eq('对已校正过的文件不再重复改动（幂等）', unpauseRecoveredModels(flat.text, official).changed, false);
+eq('改完仍是合法 JS，且名单与官方一致', pausedSetIn(flat.text), ['minimax/minimax-m3', 'z-ai/glm-5.2']);
+eq('对已校正过的文件不再重复改动（幂等）', syncPausedModels(flat.text, official).changed, false);
+// 官方只是重排自己的名单，不该引起引擎文件改写（kept 保持引擎侧顺序）
+eq('官方重排顺序不引起改写', syncPausedModels(flat.text, ['z-ai/glm-5.2', 'minimax/minimax-m3']).changed, false);
+// 顺序是确定性的：原来的命中项保持原序，新增项按官方顺序追加
+eq(
+  '新增项按官方顺序追加',
+  pausedSetIn(syncPausedModels(SAMPLE, ['minimax/minimax-m3', 'stealth/ox-alpha', 'z-ai/glm-5.2']).text),
+  ['minimax/minimax-m3', 'stealth/ox-alpha', 'z-ai/glm-5.2']
+);
 
-// 安全性：没有官方名单时绝不能动手 —— 把 null 当空名单会把官方仍在撤下的模型
-// 一起放开，而撤下模型在上游那边是"静默降级到默认模型"，那是最难查的一类错
-eq('官方名单为 null → 不动作', unpauseRecoveredModels(SAMPLE, null), null);
-eq('官方名单为空数组 → 不动作', unpauseRecoveredModels(SAMPLE, []), null);
-eq('官方名单不是数组 → 不动作', unpauseRecoveredModels(SAMPLE, 'minimax/minimax-m3'), null);
-eq('源文本不是字符串 → 不动作', unpauseRecoveredModels(null, official), null);
-eq('找不到名单声明 → 不动作', unpauseRecoveredModels('const OTHER = 1;\n', official), null);
+// 官方确实一条都没撤下（[]）是合法输入：等于把引擎那份清空。
+// 注意这跟 null 完全是两回事 —— null 必须不动任何东西。
+const emptied = syncPausedModels(SAMPLE, []);
+eq('官方名单为空数组 → 清空引擎名单', pausedSetIn(emptied.text), []);
+eq('官方名单为空数组 → 记下被移除的两项', emptied.removed, ['deepseek/deepseek-v4-flash', 'minimax/minimax-m3']);
+eq('官方名单为空数组 → 没有新增', emptied.added, []);
+
+// 安全性：没有官方名单时绝不能动手 —— 把 null 当空名单会让"同步"变成"无脑清空"，
+// 而清空的后果是放开所有拦截，撤下模型在上游那边是"静默降级到默认模型"，
+// 那是最难查的一类错
+eq('官方名单为 null → 不动作', syncPausedModels(SAMPLE, null), null);
+eq('官方名单是 undefined → 不动作', syncPausedModels(SAMPLE, undefined), null);
+eq('官方名单不是数组 → 不动作', syncPausedModels(SAMPLE, 'minimax/minimax-m3'), null);
+eq('源文本不是字符串 → 不动作', syncPausedModels(null, official), null);
+eq('找不到名单声明 → 不动作', syncPausedModels('const OTHER = 1;\n', official), null);
+// 空名单 + 无法定位声明：也是 null（不能因为"官方说空"就宣称改了文件）
+eq('声明找不到时即使官方为空也不动作', syncPausedModels('const OTHER = 1;\n', []), null);
 
 // 用户看到的那句话：必须有"是引擎本地拒的"和"下一步做什么"两块信息。
 // 以前它只能靠集成测试碰巧走到，重构里丢一半也没人发现。
@@ -737,6 +764,8 @@ eq('文案说清是引擎本地拒的、不是上游', msg.includes('vendor/work
 eq('文案给出下一步（跑更新）', msg.includes('npm run update-worker'), true);
 eq('文案给出官方判据名字', msg.includes('FREEBUFF_PAUSED_FREE_MODEL_IDS'), true);
 eq('文案解释了为什么宁可报错（上游会静默降级）', msg.includes('静默降级'), true);
+// 名单现在是自动跟官方的，文案必须说"不需要手动改"，否则用户会去手改 vendor 文件
+eq('文案说明名单是自动对齐的、不用手动改', /自动放开/.test(msg) && /不需要手动改/.test(msg), true);
 
 // 仓库里的 vendor/worker.js 必须已经是校正过的状态：防止有人用旧脚本把它盖回去，
 // 或者上游某次把 flash 又加回名单而没人注意
@@ -745,6 +774,54 @@ const { fileURLToPath } = await import('node:url');
 const shippedPaused = pausedSetIn(readFileSync(fileURLToPath(new URL('../vendor/worker.js', import.meta.url)), 'utf8'));
 eq('随包引擎里 flash 不再被误拦', shippedPaused.includes('deepseek/deepseek-v4-flash'), false);
 eq('随包引擎里官方仍在撤下的 m3 依然被拦', shippedPaused.includes('minimax/minimax-m3'), true);
+
+// ─────────────────────────────────── 官方「已撤下」名单是自动跟随的
+// 用户要的：这个项目自己分析并跟上官方的模型列表，包括"哪些被撤下了"。
+// 链路 = 官方常量源（refreshCatalog 每 6 小时自动刷）→ table.paused / pausedKnown
+//      → availabilityOf（控制台）+ checkModelAccess（门禁）。
+// 单测离线拉不到官方源，所以用显式注入口喂一份"官方风格的表"来跑这条链路。
+const PF = 'deepseek/deepseek-v4-flash'; // 官方在售
+const PW = 'minimax/minimax-m3'; // 官方撤下
+store.data.settings.disabledModels = [];
+store.data.settings.modelFallback = 'off';
+mdl.__installCatalogForTest({
+  models: [{ id: PF, agent: 'a', displayName: 'Flash' }, { id: PW, agent: 'a', displayName: 'M3' }],
+  pools: { premium: [PW], standard: [PF] },
+  paused: [PW],
+});
+// 引擎列表里两个都在 → enginePaused 为空，免得"缺席"那条路搅进来
+noteEngineModelList([PF, PW, 'noise/placeholder']);
+eq('官方名单解析出来了', mdl.officialPausedKnown(), true);
+eq('撤下的模型被识别', mdl.isPausedByOfficial(PW), true);
+eq('在售的模型不受影响', mdl.isPausedByOfficial(PF), false);
+eq('撤下状态在目录里叫 withdrawn', availabilityOf(PW).state, 'withdrawn');
+eq(
+  '撤下说明点明「官方撤下」+「静默降级」',
+  /官方撤下/.test(availabilityOf(PW).detail) && /静默降级/.test(availabilityOf(PW).detail),
+  true
+);
+const denied = mdl.checkModelAccess({ allowPaid: true, models: [] }, PW);
+eq('撤下的模型被明确拦下（不再静默降级成别的模型）', denied.status, 400);
+eq('错误的 type 与引擎自己那份保持一致（unsupported_model）', denied.type, 'unsupported_model');
+eq('在售的模型照常放行', mdl.checkModelAccess({ allowPaid: true, models: [] }, PF).ok, true);
+eq(
+  '撤下的模型不出现在 /v1/models',
+  mdl.filterModelList({ allowPaid: true, models: [] }, [{ id: PW }, { id: PF }]).map((m) => m.id),
+  [PF]
+);
+eq('控制台目录里仍然列着它（标成 withdrawn，不悄悄消失）', mdl.catalog().find((m) => m.id === PW)?.availability.state, 'withdrawn');
+store.data.settings.modelFallback = 'any';
+eq('撤下的模型不会进降级候选', mdl.fallbackCandidates(PW, { allowPaid: true, models: [] }, { limit: 20 }).includes(PW), false);
+store.data.settings.modelFallback = 'off';
+// 官方恢复上架 → 下一次自动刷新后这里就该自动放开（用"再注入一份不含它的表"模拟）
+mdl.__installCatalogForTest({ models: [{ id: PF }], pools: { premium: [], standard: [PF] }, paused: [] });
+noteEngineModelList([PF, PW, 'noise/placeholder']);
+eq('官方恢复后 withdrawn 自动消失', availabilityOf(PW).state, 'unverified');
+eq('官方恢复后请求自动放行（不需要改配置）', mdl.checkModelAccess({ allowPaid: true, models: [] }, PW).ok, true);
+// 官方名单拿不到（null / 第三方 JSON）→ 一律不拦，绝不把"不知道"当成"已撤下"
+mdl.__installCatalogForTest({ models: [{ id: PF }], pools: { premium: [], standard: [PF] }, paused: null });
+eq('官方名单没解析出来 → 不认任何模型被撤下', mdl.officialPausedKnown(), false);
+eq('官方名单没解析出来 → 不拦任何模型（fail-open）', mdl.checkModelAccess({ allowPaid: true, models: [] }, PW).ok, true);
 
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

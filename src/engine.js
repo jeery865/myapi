@@ -590,7 +590,7 @@ async function dispatchApi(req, res, url) {
     const verdict = checkModelAccess(keyRecord, requestedModel);
     if (!verdict.ok) {
       track({ status: verdict.status, ok: false, error: 'model_denied' });
-      send(res, verdict.status, errorBody(pathname, verdict.message, verdict.status));
+      send(res, verdict.status, errorBody(pathname, verdict.message, verdict.status, verdict.type));
       return;
     }
     // 把解析后的模型 id 写回请求体：判定用的是这个 id，转发给引擎的也必须是这个 id，

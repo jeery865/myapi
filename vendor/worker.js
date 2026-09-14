@@ -366,12 +366,17 @@ const STANDARD_MODELS = new Set([
 // 需要扩展暂停名单时改这里（或后续接 env PAUSED_MODELS 覆盖）。
 // ---------------------------------------------------------------------------
 const PAUSED_MODELS = new Set([
-  // ── 本段在每次 npm run update-worker 时按官方 FREEBUFF_PAUSED_FREE_MODEL_IDS
-  //    校正（见 src/vendor-patch.js）。上游那份是手写名单、没有回收机制：
-  //    模型恢复上架后条目会一直留着，请求会被引擎本地拦掉、根本发不到上游
-  //    （deepseek-v4-flash 就这么被误拦了一个月）。这里只做减法 —— 官方说
-  //    「已不撤下」的才放开，不会替上游新增暂停项。官方名单拉不到时本段不动。
+  // ── 本段由 src/vendor-patch.js 在每次 npm run update-worker 时按官方
+  //    FREEBUFF_PAUSED_FREE_MODEL_IDS **整体对齐**（恢复上架的自动放开、
+  //    新撤下的自动拦住），别手改 —— 改了下次更新就被覆盖，而且运行时不读它。
+  //    上游那份是手写名单、没有回收机制：模型恢复上架后条目会一直留着，
+  //    请求会被引擎本地拦掉、根本发不到上游（deepseek-v4-flash 就这样被误拦了一个月）。
+  //    官方名单拉不到时本段不动。
   "minimax/minimax-m3",
+  "meta/muse-spark-1.3-contributor",
+  "deepseek/deepseek-v4-pro",
+  "stealth/ox-alpha",
+  "z-ai/glm-5.2",
 ]);
 
 function isPausedModel(modelId) {
