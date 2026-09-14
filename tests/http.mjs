@@ -101,6 +101,23 @@ const flashProbe = await raw('/v1/chat/completions', {
 const flashText = await flashProbe.text();
 check('flash 不再被引擎本地误拦（已按官方名单校正）', !/unsupported_model/.test(flashText), flashText.slice(0, 200));
 
+// count_tokens 不摸上游、不占额度，所以模型门禁（checkModelAccess）本来把它排除了。
+// 但对一个已被官方撤下的模型照常报出 token 数，等于在暗示"这个模型能用"，
+// 而真发请求时它会被拦 —— 前后不一致最耗人排查。这里钉住：预检阶段就该说清楚。
+// 注：离线时靠引擎自己的 PAUSED_MODELS 拦（随包那份已同步成官方 5 项）；
+// 联网时网关先按每 6 小时自动刷新的官方名单拦。两种情况下客户端看到的都是 400。
+const pausedCount = await raw('/v1/messages/count_tokens', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: 'minimax/minimax-m3', messages: [{ role: 'user', content: 'hi' }] }),
+});
+const pausedCountText = await pausedCount.text();
+check(
+  '已撤下模型的 count_tokens 也是 unsupported_model（不是照常报数）',
+  pausedCount.status === 400 && /unsupported_model/.test(pausedCountText),
+  `${pausedCount.status} ${pausedCountText.slice(0, 160)}`
+);
+
 // ── 跨站写请求 ──
 const csrf = await admin('/keys', 'POST', { name: 'x' }, { origin: 'https://evil.example' });
 check('带外站 Origin 的写请求被拒', csrf.status === 403, `${csrf.status}`);

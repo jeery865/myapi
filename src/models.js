@@ -580,6 +580,27 @@ export function catalogMeta() {
   };
 }
 
+// 钉住的「默认模型」被官方撤下 = **每一个不带 model 的请求都会 400**。
+//
+// 这种情况必须自己喊出来：Railway 上的部署没人天天开控制台，等发现"怎么全挂了"
+// 可能已经过了很久。控制台「模型」卡那边另外会显示一行提示（见 public/app.js）。
+// 官方恢复上架后这里自然就不再响 —— 名单是每 6 小时自动刷的。
+//
+// 只对新出现的死模型提醒一次：默认模型这条路每次请求都会走一遍，刷屏比不提醒更糟。
+let warnedDeadDefault = '';
+function warnIfDefaultWithdrawn(configured) {
+  if (!isPausedByOfficial(configured)) {
+    warnedDeadDefault = '';
+    return;
+  }
+  if (warnedDeadDefault === configured) return;
+  warnedDeadDefault = configured;
+  console.warn(
+    `[models] 默认模型 ${configured} 已被官方撤下（FREEBUFF_PAUSED_FREE_MODEL_IDS）：` +
+      `不带 model 的请求会全部失败。去控制台「模型」里换成别的、或改回自动挑选；官方恢复上架后会自动变回可用。`
+  );
+}
+
 /**
  * 客户端没写 model 时用哪个。默认挑当前 standard 池里的第一个（也就是"不限量"那一档），
  * 而不是死写 flash —— 上游 2026-08-18 把 flash 挪进 premium 池之后，
@@ -589,7 +610,12 @@ export function catalogMeta() {
  */
 export function defaultModel({ hasFreebuff = true } = {}) {
   const configured = store.settings?.defaultModel;
-  if (configured && (table.models.has(configured) || hasOpencodeModel(configured))) return configured;
+  if (configured && (table.models.has(configured) || hasOpencodeModel(configured))) {
+    // 仍然照用户指定的返回（不悄悄换成别的模型 —— 那正是"你以为在用 A 其实拿的是 B"），
+    // 但要把"这个默认已经死了"喊出来
+    warnIfDefaultWithdrawn(configured);
+    return configured;
+  }
   if (!hasFreebuff) return defaultOpencodeModel();
   const disabled = new Set(store.settings?.disabledModels || []);
   const free = [...table.standard]

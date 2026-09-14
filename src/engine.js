@@ -24,6 +24,8 @@ import {
   customModelList,
   fallbackCandidates,
   DEFAULT_MODEL,
+  isPausedByOfficial,
+  officialPausedMessage,
 } from './models.js';
 import { callOpencode, classifyOpencodeFailure, ANON_KEY } from './opencode.js';
 import { isOpencodeModel, stripPrefix, withPrefix, nativeProtocol } from './models-opencode.js';
@@ -538,6 +540,14 @@ async function dispatchApi(req, res, url) {
   if (needsModelAuth && !requestedModel) {
     const hasFreebuff = store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff');
     requestedModel = defaultModel({ hasFreebuff });
+  }
+  // count_tokens 不摸上游、也不占额度，所以 needsModelAuth 把它排除了。
+  // 但对一个**已被官方撤下**的模型报出 token 数，等于在暗示"这个模型能用"，
+  // 而真发请求时它会被下面的门禁拦掉 —— 前后不一致最耗人排查。这里保持一致，
+  // 让客户端在预检阶段就知道该换模型了。
+  if (isCountTokens && isPausedByOfficial(requestedModel)) {
+    send(res, 400, errorBody(pathname, officialPausedMessage(requestedModel), 400, 'unsupported_model'));
+    return;
   }
 
   const protocol = isAnthropic ? 'anthropic' : pathname.endsWith('/responses') ? 'responses' : 'openai';

@@ -1344,8 +1344,19 @@ function renderModels(s) {
     `<option value="">自动挑一个不限量的（当前：${esc(s.defaultModel || '—')}）</option>` +
     s.models
       .filter((m) => m.enabled)
-      .map((m) => `<option value="${esc(m.id)}"${m.id === cur ? ' selected' : ''}>${esc(m.id)}${m.tier === 'paid' ? '（付费）' : ''}</option>`)
+      .map(
+        (m) =>
+          `<option value="${esc(m.id)}"${m.id === cur ? ' selected' : ''}>${esc(m.id)}${m.tier === 'paid' ? '（付费）' : ''}${
+            m.availability?.state === 'withdrawn' ? '（官方已撤下）' : ''
+          }</option>`
+      )
       .join('');
+  // 钉住的默认模型被官方撤下 = 每个不带 model 的请求都会 400。这种"配置还指着死模型"
+  // 的情况必须当场说破，别让人去翻日志 —— 官方恢复上架后这句会自动消失。
+  const curDead = s.models.find((m) => m.id === cur && m.availability?.state === 'withdrawn');
+  $('#set-defaultmodel-note').textContent = curDead
+    ? `⚠ 当前默认模型 ${cur} 已被官方撤下：不带 model 的请求会全部失败。改回「自动挑一个」或换一个模型；官方恢复后这里会自动变回可用。`
+    : '';
 }
 
 $('#set-hidedead').addEventListener('change', async (ev) => {

@@ -813,6 +813,28 @@ eq('控制台目录里仍然列着它（标成 withdrawn，不悄悄消失）', 
 store.data.settings.modelFallback = 'any';
 eq('撤下的模型不会进降级候选', mdl.fallbackCandidates(PW, { allowPaid: true, models: [] }, { limit: 20 }).includes(PW), false);
 store.data.settings.modelFallback = 'off';
+// 钉住的默认模型被官方撤下 = **每一个**不带 model 的请求都会 400。
+// Railway 上没人天天开着控制台，所以这条必须自己喊出来；但同一条只喊一次，别刷屏。
+const warns = [];
+const realWarn = console.warn;
+console.warn = (...a) => warns.push(a.join(' '));
+store.data.settings.defaultModel = PW;
+mdl.defaultModel({ hasFreebuff: true });
+mdl.defaultModel({ hasFreebuff: true });
+console.warn = realWarn;
+eq('默认模型被撤下时只告警一次（不刷屏）', warns.length, 1);
+eq('告警点名了模型 + 说了是官方撤下', warns[0].includes(PW) && /撤下/.test(warns[0]), true);
+eq('钉住的死模型照用户指定的返回（不悄悄换成别的）', mdl.defaultModel({ hasFreebuff: true }), PW);
+// 改成在售的模型 → 不再告警，且"已提醒过"的记录清掉：将来它再被撤下还能重新提醒
+store.data.settings.defaultModel = PF;
+mdl.defaultModel({ hasFreebuff: true });
+warns.length = 0;
+console.warn = (...a) => warns.push(a.join(' '));
+store.data.settings.defaultModel = PW;
+mdl.defaultModel({ hasFreebuff: true });
+console.warn = realWarn;
+eq('换回在售模型、再被撤下时会重新提醒', warns.length, 1);
+store.data.settings.defaultModel = '';
 // 官方恢复上架 → 下一次自动刷新后这里就该自动放开（用"再注入一份不含它的表"模拟）
 mdl.__installCatalogForTest({ models: [{ id: PF }], pools: { premium: [], standard: [PF] }, paused: [] });
 noteEngineModelList([PF, PW, 'noise/placeholder']);
