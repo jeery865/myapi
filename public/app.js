@@ -1283,8 +1283,19 @@ function renderModels(s) {
         .map((m) => {
           const av = m.availability || { state: 'unverified' };
           const [cls, label] = AVAIL_LABEL[av.state] || AVAIL_LABEL.unverified;
+          // 第一列：名字这颗就是复制按钮，点一下复制的是「调用名称」= m.id（填进 {"model": "..."} 的那个字符串），
+          // 不是下面那行给人看的 displayName。
           return `<tr data-id="${esc(m.id)}">
-      <td><div class="cell-main"><b class="cell-mono" style="font-weight:400">${esc(m.id)}</b>
+      <td><div class="cell-main">
+        <button type="button" class="model-copy js-copy-id" data-copy-id="${esc(m.id)}"
+          title="点击复制调用名称：${esc(m.id)}" aria-label="复制调用名称：${esc(m.id)}">
+          <span class="cell-mono model-copy-id">${esc(m.id)}</span>
+          <svg class="model-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+            <path d="M5 15V5a2 2 0 0 1 2-2h8"></path>
+          </svg>
+        </button>
         <span class="cell-sub">${providerBadge(m.provider)} ${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
           m.closedWindowUtc ? ` · UTC ${esc(m.closedWindowUtc)} 关闭` : ''
         }</span></div></td>
@@ -1315,6 +1326,14 @@ function renderModels(s) {
       toast(ev.target.checked ? `${id} 已对外提供` : `${id} 已下架`);
       sync(true);
     });
+    // 点模型名 = 复制调用名称。renderModels 每次重渲染都会重新绑一遍，所以这里跟着上面的模式走。
+    const copyBtn = $('.js-copy-id', tr);
+    if (copyBtn) {
+      copyBtn.addEventListener('click', () => {
+        const callName = copyBtn.dataset.copyId;
+        copy(callName, `已复制调用名称：${callName}`);
+      });
+    }
   });
 
   // 「列表怎么来的」面板

@@ -845,5 +845,39 @@ mdl.__installCatalogForTest({ models: [{ id: PF }], pools: { premium: [], standa
 eq('官方名单没解析出来 → 不认任何模型被撤下', mdl.officialPausedKnown(), false);
 eq('官方名单没解析出来 → 不拦任何模型（fail-open）', mdl.checkModelAccess({ allowPaid: true, models: [] }, PW).ok, true);
 
+// ── 模型列表「点模型名 = 复制调用名称」：防手滑的源码级栅栏 ──
+// 这条线最容易被人日后顺手改成 m.displayName（给人看的名字）而毫无察觉 ——
+// 因为按钮上显示的东西看起来几乎一样，只有填进 {"model": "..."} 时才会炸。
+// 项目里没有前端测试框架、也没有 jsdom，真跑 renderModels 得先造一整套 DOM，性价比太低；
+// 所以这里退一步做源码断言：它验的不是「运行时行为」，而是「这条属性/取值有没有被人改掉」。
+// 真实点击行为（点击后剪贴板确实是 m.id）已由浏览器实测确认，这里只负责拦住回归。
+{
+  const fsmod = await import('node:fs');
+  const src = fsmod.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+
+  const btn = src.match(/<button type="button" class="model-copy js-copy-id"[\s\S]*?<\/button>/);
+  eq('模型行里有一颗 js-copy-id 复制按钮', Boolean(btn), true);
+  const B = btn ? btn[0] : '';
+  eq('复制按钮带的是 data-copy-id=${esc(m.id)}', /data-copy-id="\$\{esc\(m\.id\)\}"/.test(B), true);
+  eq('复制按钮的 title 写的是调用名称', /title="点击复制调用名称：\$\{esc\(m\.id\)\}"/.test(B), true);
+  eq('复制按钮的 aria-label 写的是调用名称', /aria-label="复制调用名称：\$\{esc\(m\.id\)\}"/.test(B), true);
+  eq('按钮上显示出来的文字也是 m.id', /<span class="cell-mono model-copy-id">\$\{esc\(m\.id\)\}<\/span>/.test(B), true);
+  eq('复制按钮整段里一次都不准出现 displayName', /displayName/.test(B), false);
+  eq('行模板的 data-id 也是 m.id（行标识和复制内容同源）', /<tr data-id="\$\{esc\(m\.id\)\}">/.test(src), true);
+
+  // 取值：必须从 dataset.copyId 拿，且挨着 copy(...) 用；绑的位置必须在「每次重渲染」的循环里
+  const bindAt = src.indexOf("$$('#model-table tbody tr[data-id]').forEach");
+  const bindEnd = src.indexOf('\n  });', bindAt);
+  const win = bindAt >= 0 && bindEnd > bindAt ? src.slice(bindAt, bindEnd) : '';
+  eq('复制事件绑在每次重渲染都会重跑的那个循环里', Boolean(win) && /\.js-copy-id/.test(win), true);
+  eq('点击后取的是 copyBtn.dataset.copyId（调用名称）', /const callName = copyBtn\.dataset\.copyId;/.test(win), true);
+  eq('取到的值直接喂给 copy()，中间没有加工', /copy\(callName, [`'"]已复制调用名称：\$\{callName\}/.test(win), true);
+  eq('这段里也不准出现 displayName', /displayName/.test(win), false);
+
+  // 空列表：占位行不带 data-id，绑事件的循环本来就选不中它
+  const fallback = src.match(/: '<tr>[\s\S]{0,160}没有匹配的模型/);
+  eq('空列表的占位行不带 data-id（不会被绑事件）', Boolean(fallback) && !/data-id/.test(fallback[0]), true);
+}
+
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);
