@@ -1,4 +1,6 @@
 // 临时集成测试：HTTP 层的安全加固 + 功能回归
+import { readFileSync } from 'node:fs';
+
 const BASE = process.env.TEST_BASE || 'http://localhost:8817';
 const PASSWORD = process.env.TEST_PASSWORD || 'sec9999';
 let cookie = '';
@@ -51,7 +53,6 @@ const st = await admin('/state');
 KEY = st.json.keys[0].key;
 const FREE_MODEL = st.json.models.find((m) => m.tier === 'free' && m.enabled && !m.limitedOffer)?.id;
 const PAID_MODEL = st.json.models.find((m) => m.tier === 'paid' && m.enabled)?.id;
-const OTHER_FREE = st.json.models.find((m) => m.tier === 'free' && m.id !== FREE_MODEL)?.id;
 check('能从 state 里挑出免费/付费模型', Boolean(FREE_MODEL && PAID_MODEL), `free=${FREE_MODEL} paid=${PAID_MODEL}`);
 check('state 正常', st.status === 200 && Array.isArray(st.json.models), `${st.status}`);
 
@@ -110,15 +111,30 @@ check('超过 8MB 的请求体被拒', tooBig.status === 413 || tooBig.status ==
 
 
 // ── 不带 model 也要过门禁 ──
+// 白名单里放一个**明确不等于当前默认模型**的免费模型，这样"不带 model"的请求必须被拒。
+// 以前这里写死 OTHER_FREE（"目录里第一个不等于 FREE_MODEL 的免费模型"），
+// 而 FREE_MODEL 取的是目录顺序、defaultModel 取的是"标准池里排第一且没被引擎标缺席的"——
+// 两者由不同的规则排序，模型表一变就可能撞成同一个，门禁没坏测试却红了。
+// 所以这里直接拿当前真实的 defaultModel 做差集，条件写在断言里。
+const gateState = (await admin('/state')).json;
+const gateWhitelist = gateState.models.find(
+  (m) => m.tier === 'free' && m.enabled && m.id !== gateState.defaultModel
+)?.id;
+check('能挑出一个不等于默认模型的免费模型做白名单', Boolean(gateWhitelist), `default=${gateState.defaultModel}`);
 const onlyMimo = (await admin('/keys', 'POST', { name: 'only-mimo', allowPaid: false })).json.key;
-// 白名单里故意不放默认模型，这样"不带 model"的请求必须被拒
-await admin(`/keys/${onlyMimo.id}`, 'PATCH', { models: [OTHER_FREE || PAID_MODEL] });
+await admin(`/keys/${onlyMimo.id}`, 'PATCH', { models: [gateWhitelist] });
 const bypass = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${onlyMimo.key}` },
   body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }] }),
 });
-check('不带 model 的请求仍然要过 key 白名单', bypass.status === 403, `${bypass.status} ${(await bypass.text()).slice(0, 120)}`);
+const bypassText = await bypass.text();
+// 必须是 403 **且原因是"未授权模型"** —— 只要状态码会在别的 403（比如付费没勾）上假绿
+check(
+  '不带 model 的请求仍然要过 key 白名单',
+  bypass.status === 403 && /未授权/.test(bypassText),
+  `${bypass.status} ${bypassText.slice(0, 120)}`
+);
 
 // ── 停用 key 与不存在 key 不可区分 ──
 const dead = (await admin('/keys', 'POST', { name: 'to-disable' })).json.key;
@@ -291,7 +307,16 @@ check(
   `${absentReq.status} ${absentBody.slice(0, 160)}`
 );
 check('默认模型仍然优先挑引擎列出来的', !absent.includes(st2.json.defaultModel), String(st2.json.defaultModel));
-check('引擎版本跟 vendor 一致', st2.json.workerVersion === '1.8.10', String(st2.json.workerVersion));
+// 版本号别写死在测试里 —— 每次 npm run update-worker 都得顺手改这一行，
+// 漏一次就变成"升级成功但测试红"的假故障。直接跟 vendor/worker.js 对账。
+const VENDOR_VERSION = (
+  readFileSync(new URL('../vendor/worker.js', import.meta.url), 'utf8').match(/const VERSION = "([^"]+)"/) || []
+)[1];
+check(
+  '引擎版本跟 vendor 一致',
+  Boolean(VENDOR_VERSION) && st2.json.workerVersion === VENDOR_VERSION,
+  `${st2.json.workerVersion} vs vendor ${VENDOR_VERSION}`
+);
 
 // ── opencode Zen 号池 ──
 // 不依赖真实 Zen 调用：断言的都是目录合并、门禁分流、账号落库这些本地行为。

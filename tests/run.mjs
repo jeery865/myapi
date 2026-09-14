@@ -42,6 +42,9 @@ const protoServer = spawn(process.execPath, ['src/server.js'], {
     ADMIN_PASSWORD: 'proto-e2e-pw',
     DATA_DIR: PROTO_DATA,
     PORT: PROTO_PORT,
+    // 只绑回环：测试起的是一整个真服务（带控制台），默认的 '::' 会听所有网卡 ——
+    // 在公网 IP 或开了端口映射的机器上跑测试等于把控制台临时挂出去，没必要。
+    HOST: '127.0.0.1',
     ENABLE_BROWSER_LOGIN: 'false',
     // 假上游跑在 127.0.0.1 上，默认会被 SSRF 防护挡掉
     ALLOW_PRIVATE_UPSTREAM: 'true',
@@ -81,7 +84,7 @@ await rm(resolve(root, DATA), { recursive: true, force: true });
 const server = spawn(process.execPath, ['src/server.js'], {
   cwd: root,
   stdio: ['ignore', 'pipe', 'pipe'],
-  env: { ...process.env, ADMIN_PASSWORD: PASSWORD, DATA_DIR: DATA, PORT, ENABLE_BROWSER_LOGIN: 'false' },
+  env: { ...process.env, ADMIN_PASSWORD: PASSWORD, DATA_DIR: DATA, PORT, HOST: '127.0.0.1', ENABLE_BROWSER_LOGIN: 'false' },
 });
 let serverLog = '';
 server.stdout.on('data', (d) => (serverLog += d));

@@ -1,0 +1,75 @@
+name: update-vendor
+
+# 定时把上游引擎（worker.js）和模型表（freebuff-models.json）拉到最新，
+# 跑完自检 + 测试再提交回仓库 —— 提交之后 Railway 会自动重新部署。
+#
+# 为什么放在这里而不是本机定时任务：这个项目跑在 Railway 上，容器文件系统是临时的，
+# 而且不能指望谁的机器一直开着。GitHub Actions 是免费的、跟仓库同生共死，
+# 也不需要额外维护一套推送凭据（用自带的 GITHUB_TOKEN 就行）。
+#
+# 注意：freebuff 的**模型分类**还有一条更快的路 —— 应用启动后每 6 小时会自己
+# 从官方常量刷新一次（src/models.js 的 refreshCatalog），那条路不需要重新部署。
+# 这个工作流管的是需要重新部署才能生效的东西：引擎文件和随包兜底表。
+#
+# 如果 Railway 没有因为机器人提交而自动部署（GitHub 对 GITHUB_TOKEN 的提交
+# 不会触发其他 workflow，部分集成也会因此收不到事件），把下面那步的 push 换成
+# 个人 PAT（存成 secrets.VENDOR_PUSH_TOKEN）即可。
+
+on:
+  schedule:
+    # 每天 02:17 UTC（北京时间 10:17）。避开整点 —— GitHub 的定时队列在整点最挤，
+    # 整点的 cron 经常被推迟十几分钟。
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+# 需要写权限才能把更新后的 vendor/ 提交回去
+permissions:
+  contents: write
+
+# 同一时间只跑一个，避免两次运行互相踩
+concurrency:
+  group: update-vendor
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 测试只需要 ws；patchright 的浏览器下载用不到（这个工作流不碰浏览器），跳过省几分钟
+      - name: 安装依赖
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: 拉取上游最新
+        run: npm run update-worker
+
+      # 上游有时会改坏东西 —— 破了就别提交，仓库留在最后一个能用的版本上
+      - name: 自检
+        run: npm run check
+
+      - name: 测试
+        run: npm test
+
+      # 模型表这次踩过的坑：2026-09 上游把 premium 名单改成派生表达式，第三方生成器
+      # 跟着失效，拉下来的 JSON 里 pools.premium 是空的。update-worker 会用官方常量
+      # 补上，这里再兜一道 —— 真空了就拒绝提交，绝不把"全部免费"的表推上去。
+      - name: 校验额度池没有被清空
+        run: |
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('vendor/freebuff-models.json','utf8'));const n=j.pools&&j.pools.premium?j.pools.premium.length:0;if(!n){console.error('premium 池为空，拒绝提交');process.exit(1)};console.log('premium 池 '+n+' 个，standard '+(j.pools.standard||[]).length+' 个')"
+
+      - name: 提交并推送
+        run: |
+          if [ -z "$(git status --porcelain vendor)" ]; then
+            echo "vendor/ 没有变化，跳过提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vendor
+          git commit -m "跟随上游更新引擎和模型表（$(date -u +%Y-%m-%d)）"
+          git push

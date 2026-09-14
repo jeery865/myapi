@@ -146,27 +146,57 @@ export async function fetchOfficialTable() {
   ]);
   if (agents.size < 3) return null;
 
+  // 每个模型块自己的元数据（displayName / availability / premium / multimodal）
+  const details = parseModelDetails(modelsTs, idMap);
+
+  // ── premium 池 ────────────────────────────────────────────────────────
+  // 2026-09 上游重构：FREEBUFF_PREMIUM_MODEL_IDS / FREEBUFF_WEB_PREMIUM_MODEL_IDS
+  // 从字面量数组改成了派生表达式：
+  //   Object.freeze(FREEBUFF_MODELS.filter((m) => m.premium).map((m) => m.id))
+  // parseArrayConst 只认 `= [...] as const`，读不到它 —— premium 集合于是为空，
+  // 整张表被判成"全部免费"，没勾"允许付费"的 key 会真的去烧 premium 额度
+  // （这是静默的 fail-open，比报错更危险）。
+  // 兜底：直接读每个模型块里的 premium 字段 —— 上游那句 filter 用的就是同一份
+  // catalog 元数据，所以这就是它的展开形式。
   const premium = new Set([
     ...parseArrayConst(src, 'FREEBUFF_WEB_PREMIUM_MODEL_IDS', idMap),
     ...parseArrayConst(src, 'FREEBUFF_PREMIUM_MODEL_IDS', idMap),
   ]);
+  if (!premium.size) {
+    for (const [id, det] of Object.entries(details)) if (det.premium) premium.add(id);
+  }
   if (!premium.size) return null;
 
-  const glm = new Set(parseArrayConst(src, 'FREEBUFF_GLM_V52_MODEL_IDS', idMap));
-  if (!glm.size && idMap.FREEBUFF_GLM_V52_MODEL_ID) glm.add(idMap.FREEBUFF_GLM_V52_MODEL_ID);
+  // ── glm / referral 池 ─────────────────────────────────────────────────
+  // 旧名 FREEBUFF_GLM_V52_MODEL_IDS；2026-09 起换成 FREEBUFF_REWARD_MODEL_IDS
+  // （=[FREEBUFF_REWARD_MODEL_ID]，指向 GLM 5.3 Flash）。两个名字都认。
+  const glm = new Set([
+    ...parseArrayConst(src, 'FREEBUFF_GLM_V52_MODEL_IDS', idMap),
+    ...parseArrayConst(src, 'FREEBUFF_REWARD_MODEL_IDS', idMap),
+  ]);
+  if (!glm.size) {
+    const reward =
+      idMap.FREEBUFF_REWARD_MODEL_ID || idMap.FREEBUFF_GLM_V53_FLASH_MODEL_ID || idMap.FREEBUFF_GLM_V52_MODEL_ID;
+    if (reward) glm.add(reward);
+  }
+
   const limitedOffer = new Set(parseArrayConst(src, 'FREEBUFF_LIMITED_OFFER_MODEL_IDS', idMap));
+  // DeepSeek 家族名单上游也删了；留空即可 —— models.js 的 isDeepSeekFamily 会按
+  // `deepseek/` 前缀兜底，不需要在这里重复一份。
   const deepseek = new Set(parseArrayConst(src, 'FREEBUFF_DEEPSEEK_MODEL_IDS', idMap));
 
-  // standard = 全集 - premium - glm（官方就是这么推导 WEB_STANDARD 的）
+  // standard = 全集 - premium - glm（官方就是这么推导 FREEBUFF_STANDARD_MODEL_IDS 的）
   const standard = new Set([...agents.keys()].filter((id) => !premium.has(id) && !glm.has(id)));
 
-  const details = parseModelDetails(modelsTs, idMap);
   return {
     models: [...agents.entries()].map(([id, agent]) => ({ id, agent, session: id, ...(details[id] || {}) })),
     details,
     pools: { premium: [...premium], standard: [...standard], glm: [...glm] },
     limits: {
-      premium: parseNumberConst(src, 'FREEBUFF_PREMIUM_SESSION_LIMIT', 6),
+      // 2026-09 上游是 5；再往前是 4（README 里那个数字）。
+      premium: parseNumberConst(src, 'FREEBUFF_PREMIUM_SESSION_LIMIT', 5),
+      // FREEBUFF_WEB_STANDARD_SESSION_LIMIT 已被上游删除（standard 池现在不计量），
+      // 保留 6 只是为了在控制台文案里有个老数字，不影响门禁。
       standard: parseNumberConst(src, 'FREEBUFF_WEB_STANDARD_SESSION_LIMIT', 6),
       deepseek: parseNumberConst(src, 'FREEBUFF_DEEPSEEK_SESSION_LIMIT', 0),
     },

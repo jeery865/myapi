@@ -1,8 +1,10 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.10";
+const VERSION = "1.8.10.3";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
+const SDK_UA = "ai-sdk/openai-compatible/1.0.25/codebuff";
+const DESKTOP_UA = "Freebuff-CLI/0.0.138";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
@@ -327,19 +329,14 @@ const MODELS = [
 ];
 
 // ---------------------------------------------------------------------------
-// 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
+// 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-21 实证）
 //
-// 官方三种额度池（都是 session 次数，非 token 数）：
-//   1. PREMIUM 池：共享 6 次/天（FREEBUFF_PREMIUM_SESSION_LIMIT=6）
-//      m3 / v4-pro / luna / laguna-s-2.1 / muse-spark / greg-2 等
-//      （FREEBUFF_WEB_PREMIUM_MODEL_IDS）
-//   2. STANDARD 池：浏览器/Web 端 6 次/天
-//      （FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6；= 所有非 premium 模型，
-//      即 Flash / MiMo 2.5 等。FREEBUFF_WEB_STANDARD_MODEL_IDS）
-//      ⚠️ 注释原文："The CLI keeps these models UNLIMITED; browser surfaces
-//      cap fresh sessions to deter automated project/session churn."
-//      → CLI 协议 Flash 无限，但 CLI 已被官方封堵（free_mode_cli_required）；
-//        桌面版/Web 协议下 Flash 同样受 6 次/天限制
+// 官方额度机制（2026-08-20 起 per-model 会话配额）：
+//   1. PREMIUM 池：FREEBUFF_PER_MODEL_SESSION_CAPS 表（每号每模型）
+//      V4 Pro（deepseek_pro 池）limit 1/天；GPT-5.6 Luna（luna 池）limit 1/天
+//      （旧 FREEBUFF_DEEPSEEK_SESSION_LIMIT=1 共享上限已删除）
+//   2. STANDARD 池：不限会话数；Flash 刻意不进 caps 表（推荐默认，
+//      填共享 premium 池剩余）；MiMo 2.5 unlimited
 //   3. GLM 5.2 池：独立，referral 解锁（不计入以上）
 //
 // 桌面版并发桶（FREEBUFF_DESKTOP_SESSION_LIMITS，仅限并发非额度）：
@@ -370,6 +367,9 @@ const STANDARD_MODELS = new Set([
 // ---------------------------------------------------------------------------
 const PAUSED_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
+  // 2026-08-20 官方下线 MiniMax M3（FREEBUFF_PAUSED_FREE_MODEL_IDS），
+  // admission 返回 410 model_unavailable，新会话必然失败。
+  "minimax/minimax-m3",
 ]);
 
 function isPausedModel(modelId) {
@@ -663,7 +663,9 @@ function isQuotaExhausted(info, sessionModel) {
   if (["rate_limited", "banned", "country_blocked", "token_invalid", "blocked", "model_locked", "ip_capped"].includes(info.state)) return true;
   // STANDARD 没有可靠的剩余次数查询；只处理明确的账号/上游状态，
   // 不根据 rateLimitsByModel 的 STANDARD 数字判断耗尽。
-  if (modelPoolCategory(sessionModel) === "standard") return false;
+  // 暂停模型（pool 归类为 null）同理：数字快照不作为耗尽 oracle。
+  const poolCat = modelPoolCategory(sessionModel);
+  if (poolCat === "standard" || poolCat === null) return false;
   if (!info.quota) return false;
   let entry = info.quota[sessionModel];
   if (!entry && modelPoolCategory(sessionModel) === "premium") {
@@ -701,6 +703,16 @@ class QuotaExhaustedError extends Error {
   }
 }
 
+// 官方下线/暂停模型（2026-08-20 起 M3 返回 410 model_unavailable，endsTheSession=false）。
+// 全局性失败：换号无意义，收到后立即向客户端返回明确错误，不进入账号轮询。
+class ModelUnavailableError extends Error {
+  constructor(modelId, upstreamMessage) {
+    super("model unavailable upstream (paused/withdrawn): " + modelId + (upstreamMessage ? " — " + upstreamMessage : ""));
+    this.name = "ModelUnavailableError";
+    this.modelId = modelId;
+  }
+}
+
 class EmptyUpstreamStreamError extends Error {
   constructor() {
     super("upstream returned an empty stream");
@@ -731,9 +743,10 @@ async function deleteUpstreamSession(token, instanceId) {
 let chainTail = Promise.resolve();
 const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function jitterSleep() { return sleep(CHAIN_GAP_MS + Math.floor(Math.random() * 1200)); }
 
 function enqueue(fn) {
-  const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
+  const run = chainTail.then(() => jitterSleep()).then(fn);
   chainTail = run.catch(() => {});
   return run;
 }
@@ -747,7 +760,8 @@ const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const headers = {};
-  // 桌面版协议：不手动设置 User-Agent（fetch 默认），只带必要的业务头
+  // 桌面版协议：所有请求带 SDK User-Agent（free 模式识别依赖此 UA）
+  headers["User-Agent"] = SDK_UA;
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
@@ -896,13 +910,13 @@ async function runNormalClientBehavior(token, clientFingerprint) {
         sessionId: crypto.randomUUID(),
         surface: "waiting_room",
         device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
-        userAgent: "Freebuff-CLI/0.0.138",
-      }, { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+        userAgent: DESKTOP_UA,
+      }, { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
       if (ad.status === 200 && impUrl) {
         await enqueueUp("POST", "/api/v1/ads/impression", token,
           { impUrl, mode: "free" },
-          { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+          { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       }
     } catch (e) { failures.push("ads:" + String(e && e.message || e).slice(0, 80)); }
   }
@@ -918,8 +932,6 @@ async function runNormalClientBehavior(token, clientFingerprint) {
 }
 
 async function createSession(token, sessionModel, forceCreate = false) {
-  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
-  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
     const cached = sessCache.get(token + ":" + sessionModel);
@@ -987,6 +999,11 @@ async function createSession(token, sessionModel, forceCreate = false) {
     throw new Error("session stayed queued (retry later)");
   }
   if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
+  // 410 model_unavailable：官方已下线该模型（admission 阶段拒绝，endsTheSession=false）。
+  // 全局失败，抛专用错误让上层立即返回，不换号重试。
+  if (r.status === 410 || hasExactErrorCode(r.data, "model_unavailable")) {
+    throw new ModelUnavailableError(sessionModel, String((r.data && (r.data.message || r.data.error)) || r.text || "").slice(0, 200));
+  }
   throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
 }
 
@@ -1418,6 +1435,10 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       console.error("[code_review]", e);
+      // 官方下线模型：全局失败，立即返回，不换号。
+      if (e instanceof ModelUnavailableError) {
+        return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
+      }
       lastErrMsg = String(e.message || e);
       if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
       if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
@@ -1496,6 +1517,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         }
         errText = await resp.text();
         recordAccountObservation(token, resp.status, errText);
+        // 410 model_unavailable：官方下线该模型，全局失败，立即返回不换号
+        let parsedErr = null;
+        try { parsedErr = JSON.parse(errText); } catch {}
+        if (resp.status === 410 || hasExactErrorCode(parsedErr, "model_unavailable")) {
+          throw new ModelUnavailableError(mc.session, errText.slice(0, 200));
+        }
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
         const staleSession =
@@ -1533,6 +1560,10 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     } catch (e) {
       console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
+      // 官方下线模型：全局失败，立即向客户端返回明确错误，不换号、不计冷却。
+      if (e instanceof ModelUnavailableError) {
+        return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
+      }
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
@@ -1785,6 +1816,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  const toolCalls = new Map(); // 上游 tool_calls index -> {id, name, arguments}
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -1802,6 +1834,19 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
         const delta = choice.delta || {};
         if (delta.content) content += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        // 工具调用增量（chat 格式 delta.tool_calls[]）
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolCalls.get(ti);
+            if (!item) { item = { id: "", name: "", arguments: "" }; toolCalls.set(ti, item); }
+            if (tc.id) item.id = tc.id;
+            const fn = tc.function || {};
+            if (fn.name && !item.name) item.name = fn.name;
+            if (fn.arguments) item.arguments += fn.arguments;
+          }
+        }
         if (choice.finish_reason) finishReason = choice.finish_reason;
         if (obj.id) id = obj.id;
         if (obj.model) model = obj.model;
@@ -1810,6 +1855,13 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
     }
   }
   const msg = { role: "assistant", content };
+  if (toolCalls.size) {
+    msg.tool_calls = [...toolCalls.entries()].sort((x, y) => x[0] - y[0]).map(([, v]) => ({
+      id: v.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+      type: "function",
+      function: { name: v.name, arguments: v.arguments },
+    }));
+  }
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
   else if (reasoning) msg.reasoning_content = reasoning;
   return {
