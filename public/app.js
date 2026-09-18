@@ -87,12 +87,14 @@ function quotaRatio(text) {
 
 const POOL_LABEL = { any: '全部', free: '仅免费', paid: '付费优先' };
 const POOL_FULL = { any: '全部模型', free: '仅免费模型', paid: '付费模型优先' };
-// 号池里两个上游的标记。opencode 的号是一个 Zen API key，不是登录出来的账号，
-// 所以列表里要能一眼分清 —— 它们的「用途」「检测」含义都不一样。
-const PROVIDER_NAME = { freebuff: 'freebuff', opencode: 'opencode Zen' };
+// 号池里几个内置上游的标记。opencode 的号是一个 Zen API key、cline 的号是一个
+// refreshToken，都不是 freebuff 那种登录出来的 authToken，所以列表里要能一眼分清
+// —— 它们的「用途」「检测」含义都不一样。
+const PROVIDER_NAME = { freebuff: 'freebuff', opencode: 'opencode Zen', cline: 'Cline' };
 const PROVIDER_BADGE = {
   freebuff: '<span class="tag prov">freebuff</span>',
   opencode: '<span class="tag prov oc">opencode</span>',
+  cline: '<span class="tag prov cl">cline</span>',
 };
 
 /** 上游角标。自定义上游的名字是用户起的，从 STATE 里查 */
@@ -1006,7 +1008,7 @@ function renderOverview(s) {
 
   // 上手三步（真实顺序，做完了就打勾）
   const steps = [
-    { done: total > 0, label: '给某个上游加 Key', hint: 'freebuff 走登录，opencode / 自定义上游直接贴 key' },
+    { done: total > 0, label: '给某个上游加 Key', hint: 'freebuff / cline 走登录，opencode / 自定义上游直接贴 key' },
     { done: s.keys.length > 0, label: '复制 Base URL 和 Key 到客户端', hint: '上面「复制完整配置」一键带走' },
     { done: Boolean(window.__selftestPassed), label: '跑一次自检确认链路通', hint: '右上「运行自检」' },
   ];
@@ -1163,7 +1165,13 @@ function renderAccounts(s) {
       btn.innerHTML = '<span class="spin"></span>';
       try {
         const r = await api(`/accounts/${id}/check`, { method: 'POST' });
-        toast(`${acct.email || id}：${r.status.verdict} —— ${r.status.detail}`, r.status.state === 'ok' ? 'ok' : 'warn', 7000);
+        // cline 这类"没有 0 消耗探活端点"的上游只回一句说明（probe），不改账号状态
+        const info = r.probe || r.status || {};
+        toast(
+          `${acct.email || id}：${info.verdict || '已检测'} —— ${info.detail || ''}`,
+          r.probe ? 'warn' : r.status?.state === 'ok' ? 'ok' : 'warn',
+          8000
+        );
       } catch (err) {
         toast(err.message, 'err');
       }
@@ -1954,21 +1962,23 @@ function mountViewer(prefix, R, io, { onFrame } = {}) {
 
 /**
  * 添加账号：**先选上游，再按那个上游自己的方式录入**。
- * 三种上游的录入方式本来就不一样，混在一排标签里选会让人以为
+ * 几个上游的录入方式本来就不一样，混在一排标签里选会让人以为
  * "授权链接"也能用来加 opencode 的 key。
  *   freebuff  —— 授权链接 / 内置浏览器 / 粘贴 authToken（三条都保留）
  *   opencode  —— 直接贴 Zen key，或者用服务器的指纹浏览器登录后复制
+ *   cline     —— 设备码授权链接 / 内置浏览器 / 粘贴 refreshToken
  *   自定义上游 —— 只有贴 key 这一种
  * preselect 传上游 id 时跳过选择那一步（上游卡上的「加 Key」就是这么进来的）。
  */
 function openAddAccount(preselect = null) {
   const list = STATE.providers?.list || [];
   const picked = preselect ? list.find((u) => u.id === preselect) : null;
-  // 只有一个上游可选时（比如全新部署只有内置那两个）也照样让用户确认一下，
-  // 因为 freebuff 和 opencode 的录入方式差别很大
+  // 只有一个上游可选时（比如全新部署只有内置那几个）也照样让用户确认一下，
+  // 因为内置上游之间的录入方式差别很大
   if (!picked) return openPickUpstream(list);
   if (picked.id === 'freebuff') return openFreebuffAdd(picked);
   if (picked.id === 'opencode') return openOpencodeAdd(picked);
+  if (picked.id === 'cline') return openClineAdd(picked);
   return openAddKeys(picked);
 }
 
@@ -1984,7 +1994,9 @@ function openPickUpstream(list) {
             ? '授权链接登录 / 内置浏览器登录 / 粘贴 authToken'
             : u.id === 'opencode'
               ? '贴 Zen API key，或用内置浏览器登录后复制'
-              : `贴 ${esc(u.credentialLabel || 'API key')}（${esc(u.formatLabel || u.format)}）`;
+              : u.id === 'cline'
+                ? '设备码授权链接 / 内置浏览器登录 / 粘贴 refreshToken'
+                : `贴 ${esc(u.credentialLabel || 'API key')}（${esc(u.formatLabel || u.format)}）`;
         return `<button class="pick" data-id="${esc(u.id)}" type="button"${u.enabled ? '' : ' disabled'}>
         <span class="pick-top"><b>${esc(u.name)}</b>${u.builtin ? '<span class="tag">内置</span>' : `<span class="tag prov oc">${esc(u.format)}</span>`}${
           u.enabled ? '' : '<span class="tag bad">已停用</span>'
@@ -2291,6 +2303,223 @@ function openOpencodeAdd() {
       btn.disabled = false;
     }
   });
+}
+
+/**
+ * Cline：三条路都是拿到同一个东西 —— 一个 refreshToken。
+ *
+ * 它走的是 WorkOS 的设备授权码流程（不是 freebuff 那种 CLI 授权码），所以链接上
+ * 要配一个设备码一起给用户看：链接里通常已经带好了，但万一没带上，授权页会要求手输。
+ * 用户可以在自己手机上开链接（推荐），也可以让服务器的 Chromium 去开。
+ * 第三条路是直接粘贴 refreshToken（已经有号、或从别处迁移过来）。
+ */
+function openClineAdd() {
+  const br = STATE.browser;
+  const d = openDialog(
+    '添加 Cline 账号',
+    `<p class="muted small">Cline 的凭据是一个 <b>refreshToken</b>（不是 API key）。下面三条路拿到的都是它。</p>
+    <div class="methods" id="cmethods">
+      <button class="method is-on" data-m="link" type="button"><b>设备码授权</b>
+        <small>生成授权链接 + 设备码，你在自己手机上打开授权，服务器轮询到就自动入池。推荐。</small></button>
+      <button class="method" data-m="browser" type="button"${br.available ? '' : ' disabled'}><b>内置浏览器</b>
+        <small>${br.available ? '服务器开一个 Chromium，画面推到这里，你在这儿完成授权。' : `当前不可用：${esc(br.reason || br.loadError || '未安装 Chromium')}`}</small></button>
+      <button class="method" data-m="paste" type="button"><b>粘贴 refreshToken</b>
+        <small>已经有 refreshToken（比如从别处迁移）就直接贴进来。</small></button>
+    </div>
+
+    <div data-p="link">
+      <p class="muted small">向 WorkOS 申请一个设备码。授权链接里一般已经把设备码带上了；万一没带上，授权页会让你手输下面那个码。</p>
+      <div class="fieldrow">
+        ${poolSelect('cl-pool')}
+        <button class="btn primary" id="cl-start" type="button">生成授权链接</button>
+      </div>
+      <div id="cl-area" class="hidden" style="margin-top:14px">
+        <label class="field"><span class="lbl">授权链接</span>
+          <input type="text" id="cl-url" readonly></label>
+        <div id="cl-code-row" class="hidden">
+          <label class="field"><span class="lbl">设备码 · 授权页要求时填这个</span>
+            <input type="text" id="cl-code" readonly></label>
+        </div>
+        <div class="btnrow" style="margin-top:0">
+          <button class="btn primary" id="cl-open" type="button">打开授权页</button>
+          <button class="btn" id="cl-copy" type="button">复制链接</button>
+        </div>
+        <div class="flowstate" id="cl-state"></div>
+        <div class="flowlog hidden" id="cl-log"></div>
+      </div>
+    </div>
+
+    <div data-p="browser" class="hidden">
+      ${
+        br.available
+          ? `<p class="muted small">画面来自服务器上的 patchright Chromium（${br.headless ? 'headless' : 'headful + Xvfb，指纹更接近真机'}）。在这儿完成 WorkOS 授权就行，不用另开窗口。</p>
+      <div class="fieldrow">
+        ${poolSelect('clb-pool')}
+        <label class="field" style="max-width:200px;margin:0"><span class="lbl">浏览器身份</span>
+          <select id="clb-profile">
+            <option value="fresh">全新指纹（每个号一套，推荐）</option>
+            <option value="shared">复用上次会话（留 cookie）</option>
+          </select></label>
+        <button class="btn primary" id="clb-start" type="button">启动并打开授权页</button>
+      </div>
+      ${viewerMarkup('clb')}
+      <div class="flowstate" id="clb-state"></div>
+      <div class="flowlog hidden" id="clb-log"></div>`
+          : `<p class="muted small">内置浏览器没启用，用「设备码授权」加号效果完全一样。</p>`
+      }
+    </div>
+
+    <div data-p="paste" class="hidden">
+      <p class="muted small">一行一个 refreshToken，可以一次贴多个。</p>
+      <div class="fieldrow">${poolSelect('clp-pool')}</div>
+      <label class="field" style="margin-top:12px"><span class="lbl">refreshToken</span>
+        <textarea id="clp-token" placeholder="每行一个"></textarea></label>
+      <div class="btnrow"><button class="btn primary" id="clp-go" type="button">加入号池</button></div>
+    </div>`,
+    { width: 1040, onClose: () => teardown() }
+  );
+
+  const R = d.root;
+  let flow = null;
+  let flowTimer = null;
+  let ws = null;
+
+  function teardown() {
+    clearInterval(flowTimer);
+    try {
+      ws?.close();
+    } catch {}
+    ws = null;
+    if (flow && flow.state === 'pending') api(`/login-flow/${flow.id}/cancel`, { method: 'POST' }).catch(() => {});
+  }
+
+  $('#cmethods', R).addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.method');
+    if (!btn || btn.disabled) return;
+    $$('.method', R).forEach((b) => b.classList.toggle('is-on', b === btn));
+    $$('[data-p]', R).forEach((p) => p.classList.toggle('hidden', p.dataset.p !== btn.dataset.m));
+  });
+
+  const STATE_TEXT = {
+    pending: '等你在授权页完成登录…',
+    done: '登录成功，账号已入池',
+    error: '没成功',
+    timeout: '等太久了，重新生成吧',
+    cancelled: '已取消',
+  };
+
+  function renderFlow() {
+    if (!flow) return;
+    const lampCls = flow.state === 'pending' ? 'busy' : flow.state === 'done' ? 'ok' : 'bad';
+    const text = `${STATE_TEXT[flow.state] || flow.state}${flow.error ? ` —— ${flow.error}` : ''}`;
+    for (const [sid, lid] of [['#cl-state', '#cl-log'], ['#clb-state', '#clb-log']]) {
+      const sEl = $(sid, R);
+      const lEl = $(lid, R);
+      if (sEl) sEl.innerHTML = `<i class="lamp ${lampCls}"></i><span>${esc(text)}</span>`;
+      if (lEl && flow.log?.length) {
+        lEl.classList.remove('hidden');
+        lEl.innerHTML = flow.log.map((l) => `<div>${esc(l.message)}</div>`).join('');
+        lEl.scrollTop = lEl.scrollHeight;
+      }
+    }
+    // 设备码只在流程刚开始时才有意义，但显示出来不碍事（授权成功后它会跟着消失）
+    if (flow.userCode && $('#cl-code', R)) {
+      $('#cl-code-row', R).classList.remove('hidden');
+      $('#cl-code', R).value = flow.userCode;
+    }
+    if (flow.state === 'done') {
+      clearInterval(flowTimer);
+      toast(`${flow.account?.email || '账号'} 已入池`, 'ok', 5000);
+      sync();
+      setTimeout(() => d.close(), 1600);
+    } else if (['error', 'timeout', 'cancelled'].includes(flow.state)) {
+      clearInterval(flowTimer);
+    }
+  }
+
+  function startPolling() {
+    clearInterval(flowTimer);
+    flowTimer = setInterval(async () => {
+      try {
+        flow = (await api(`/login-flow/${flow.id}`)).flow;
+        renderFlow();
+      } catch {
+        clearInterval(flowTimer);
+      }
+    }, 2500);
+  }
+
+  // ── 方式一：设备码授权链接 ──
+  $('#cl-start', R).addEventListener('click', async () => {
+    const btn = $('#cl-start', R);
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin"></span> 申请中';
+    try {
+      flow = (
+        await api('/login-flow', { method: 'POST', body: { provider: 'cline', mode: 'link', pool: $('#cl-pool', R).value } })
+      ).flow;
+      $('#cl-area', R).classList.remove('hidden');
+      $('#cl-url', R).value = flow.loginUrl;
+      renderFlow();
+      startPolling();
+      window.open(flow.loginUrl, '_blank', 'noopener');
+    } catch (err) {
+      toast(err.message, 'err', 8000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '重新生成链接';
+    }
+  });
+  $('#cl-open', R).addEventListener('click', () => flow && window.open(flow.loginUrl, '_blank', 'noopener'));
+  $('#cl-copy', R).addEventListener('click', () => flow && copy(flow.loginUrl, '链接已复制'));
+
+  // ── 方式三：粘贴 refreshToken ──
+  $('#clp-go', R).addEventListener('click', async () => {
+    const raw = $('#clp-token', R).value.trim();
+    if (!raw) return toast('先把 refreshToken 粘进来', 'warn');
+    try {
+      const r = await api('/accounts', {
+        method: 'POST',
+        body: { token: raw, provider: 'cline', pool: $('#clp-pool', R).value, name: 'Cline' },
+      });
+      toast(`已加入 ${r.added} 个 Cline 号`);
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
+
+  // ── 方式二：内置浏览器 ──
+  const io = { get: () => ws, set: (v) => (ws = v) };
+  const clViewer = mountViewer('clb', R, io);
+  if (clViewer) {
+    $('#clb-start', R).addEventListener('click', async () => {
+      const btn = $('#clb-start', R);
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span> 启动中';
+      $('#clb-viewer', R).classList.remove('hidden');
+      try {
+        flow = (
+          await api('/login-flow', {
+            method: 'POST',
+            body: { provider: 'cline', mode: 'browser', pool: $('#clb-pool', R).value, profile: $('#clb-profile', R).value },
+          })
+        ).flow;
+        renderFlow();
+        startPolling();
+        clViewer.connect(flow.id);
+        $('#clb-viewer', R).scrollIntoView({ block: 'nearest' });
+        clViewer.screen.focus();
+      } catch (err) {
+        toast(err.message, 'err', 9000);
+        $('#clb-vw-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '重新启动';
+      }
+    });
+  }
 }
 
 // ─────────────────────────────────────────────── 启动

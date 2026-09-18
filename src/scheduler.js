@@ -19,7 +19,7 @@ import { store, providerOf } from './store.js';
 import { probeAccount } from './probe.js';
 import { probeOpencodeKey } from './opencode.js';
 import { refreshCatalog } from './models.js';
-import { needsRecheck, recheckIntervalMs, advanceRescue } from './account-status.js';
+import { needsRecheck, recheckIntervalMs, advanceRescue, providerHasNoProbe } from './account-status.js';
 import { getUpstream } from './upstreams.js';
 import { probeUpstreamKey } from './protocols/index.js';
 
@@ -39,7 +39,16 @@ let busy = false;
 /** 找出"到期了、需要实测一下"的账号 */
 function pendingAccounts(now = Date.now()) {
   return store.accounts.filter(
-    (a) => a.enabled !== false && a.token && a.token.length > 8 && needsRecheck(a, now)
+    (a) =>
+      a.enabled !== false &&
+      a.token &&
+      a.token.length > 8 &&
+      // 探不了活的上游（cline）不进常规复检：复检对它们只会返回 null、什么也不做，
+      // 但会一直占着下面那个 batch 名额 —— 号池一多就会把真正能复检的 freebuff/opencode
+      // 号挤在队列后面永远轮不到。状态的可恢复性由它们自己的 recoverAt 保证
+      // （failureStatus 会给它们写冷却，见 src/account-status.js 的 NO_PROBE_PROVIDERS）。
+      !providerHasNoProbe(providerOf(a)) &&
+      needsRecheck(a, now)
   );
 }
 
@@ -55,8 +64,9 @@ export async function recheckAccounts(batch = RECHECK_BATCH) {
   for (const acct of pending) {
     const prov = providerOf(acct);
     try {
-      // 只探这两种内置上游。自定义上游没有统一的探活接口，
-      // 硬发一个最小请求过去等于拿用户的额度做体检 —— 不做。
+      // 只探这两种内置上游。cline 没有 per-account 的只读端点（原版也没有），
+      // 自定义上游没有统一的探活接口 —— 硬发一个最小请求过去等于拿用户的额度做体检。
+      // 所以它们一律返回 null（cline 更是连 pendingAccounts 都进不来）。
       const result =
         prov === 'opencode'
           ? await probeOpencodeKey(acct.token)
@@ -109,8 +119,16 @@ async function probeAccountForRescue(acct) {
   const prov = providerOf(acct);
   if (prov === 'opencode') return probeOpencodeKey(acct.token);
   if (prov === 'freebuff') return probeAccount(acct.token, { raw: true });
+  // cline 探不了活：原版 cline2api 只有一个 `/v1/health`，而且它不校验凭据、只报账号数量，
+  // 拿不到任何 per-account 的结论。返回 null 让 probeAndAdvanceRescue 走
+  // 「拿不到结论 → 立刻结束抢救期交回常规复检」那条分支。
+  // （不过正常情况下 cline 根本不会进抢救期 —— failureStatus 对 NO_PROBE_PROVIDERS
+  //   直接写 recoverAt，见 src/account-status.js。这里是第二道保险。）
+  if (prov === 'cline') return null;
+  // 必须排除**内置**上游：getUpstream() 对内置的也返回对象，而内置的 baseUrl 是空串，
+  // 拿 probeUpstreamKey 去打只会造出一个假的失败结果。
   const up = getUpstream(prov);
-  if (up) return probeUpstreamKey(up, acct.token);
+  if (up && !up.builtin) return probeUpstreamKey(up, acct.token);
   return null;
 }
 

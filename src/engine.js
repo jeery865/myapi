@@ -1,4 +1,6 @@
-// 引擎适配层：把 Node 请求转成 vendor/worker.js 的 fetch(request, env) 调用。
+// 引擎适配层：把 Node 请求转成随包引擎的 fetch(request, env) 调用。
+// 两个引擎：vendor/worker.js（freebuff）和 vendor/cline-worker.js（cline），
+// 形态完全一样（单文件 Cloudflare Worker），区别只在 env 的字段名和模型命名空间。
 //
 // 账号选择在这一层做，不交给 worker：
 //   worker 内部的 pickToken 是轮询（每次调用都推进 accountIdx），一个请求里会挨个
@@ -6,6 +8,7 @@
 //   一个 token 放进 env —— worker 的池子里只有一个号，自然没法轮询 —— 失败了由
 //   这一层决定要不要换号重试。手动模式下连重试都不做。
 import worker from '../vendor/worker.js';
+import clineWorker from '../vendor/cline-worker.js';
 import { config } from './config.js';
 import { store, providerOf } from './store.js';
 import {
@@ -19,6 +22,7 @@ import {
   defaultModel,
   providerForModel,
   opencodeModelList,
+  clineModelList,
   upstreamForModel,
   stripUpstreamPrefix,
   customModelList,
@@ -29,6 +33,8 @@ import {
 } from './models.js';
 import { callOpencode, classifyOpencodeFailure, ANON_KEY } from './opencode.js';
 import { isOpencodeModel, stripPrefix, withPrefix, nativeProtocol } from './models-opencode.js';
+import { isClineModel, stripClinePrefix } from './models-cline.js';
+import { buildClineEnv } from './cline.js';
 import { adapterFor, callUpstreamApi, classifyUpstreamFailure } from './protocols/index.js';
 import { rotationRule, nextCursor, setRotationRule } from './upstreams.js';
 import {
@@ -538,8 +544,12 @@ async function dispatchApi(req, res, url) {
   // 解析出来的 id 会写回请求体，所以引擎拿到的是这里定下来的模型，不是它自己的默认值。
   // 池子里一个 freebuff 号都没有时挑 opencode 的免费模型，不然必然 503。
   if (needsModelAuth && !requestedModel) {
-    const hasFreebuff = store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff');
-    requestedModel = defaultModel({ hasFreebuff });
+    const hasProvider = (p) => store.accounts.some((a) => a.enabled && providerOf(a) === p);
+    requestedModel = defaultModel({
+      hasFreebuff: hasProvider('freebuff'),
+      hasOpencode: hasProvider('opencode'),
+      hasCline: hasProvider('cline'),
+    });
   }
   // count_tokens 不摸上游、也不占额度，所以 needsModelAuth 把它排除了。
   // 但对一个**已被官方撤下**的模型报出 token 数，等于在暗示"这个模型能用"，
@@ -611,6 +621,11 @@ async function dispatchApi(req, res, url) {
     }
   }
 
+  // Responses 客户端（SDK 打 …/responses）。freebuff 的引擎自己认这个端点，
+  // 所以那条路照旧原样透传；cline 的引擎只认 /v1/chat/completions 和 /v1/messages，
+  // 得在这层显式翻一次（见下面 planFor 的 repliesToChat 与 callUpstream 的 cline 分支）。
+  const isResponsesInbound = pathname.endsWith('/responses');
+
   const makeRequest = (modelOverride) =>
     new Request(`${url.origin || 'http://internal'}${pathname}${url.search}`, {
       method: req.method,
@@ -629,6 +644,21 @@ async function dispatchApi(req, res, url) {
           : raw.length
             ? raw
             : null,
+    });
+
+  /**
+   * 给 cline 引擎发一次请求。
+   *
+   * 和 freebuff 那条不一样的地方：**路径固定是 /v1/chat/completions**。
+   * cline 引擎只认 chat 和 anthropic 两个端点，而我们的中枢格式就是 chat ——
+   * 客户端无论说 Anthropic 还是 Responses，都在这里先归一成 chat 再发，
+   * 引擎那边就只需要处理"chat 进、chat 出"这一种情况（回来的响应再由下游翻回客户端协议）。
+   */
+  const clineChatRequest = (chatBody) =>
+    new Request('http://internal/v1/chat/completions', {
+      method: 'POST',
+      headers: new Headers({ authorization: `Bearer ${presented}`, 'content-type': 'application/json' }),
+      body: JSON.stringify(chatBody),
     });
 
   /**
@@ -656,28 +686,47 @@ async function dispatchApi(req, res, url) {
     const up = modelId ? upstreamForModel(modelId) : null;
     // opencode 上这个模型的原生协议（chat / anthropic / responses / google）
     const native = modelId && isOpencodeModel(modelId) ? nativeProtocol(modelId) : null;
+    const cline = Boolean(modelId && isClineModel(modelId));
     let how = null;
     if (native) {
       if (isAnthropic && native !== 'anthropic') how = 'a2c';
       else if (!isAnthropic && native === 'anthropic') how = 'c2a';
-    } else if (up && isAnthropic) {
+    } else if ((up || cline) && isAnthropic) {
       // 客户端发的是 Anthropic，内部一律先归一到 chat
       how = 'a2c';
     }
     // responses / google 这两种没有直接的 chat↔它 的桥，统一走 protocols 适配器：
     // 先把请求归一成 chat，再由适配器翻过去（回来的响应同理）
     const adapter = native === 'responses' || native === 'google' ? adapterFor(native) : null;
-    return { modelId, customUp: up, bridge: how, ocAdapter: adapter };
+    // cline 的引擎只会说 chat，而 Responses 客户端发来的 body（input/instructions…）
+    // 它完全不认 —— 所以这一档要**由我们把入站也翻成 chat**，出站再翻回 responses。
+    // freebuff 的引擎自己支持 /v1/responses，那条路保持原样透传，别去动它。
+    const repliesToChat = cline && isResponsesInbound;
+    return { modelId, customUp: up, bridge: how, ocAdapter: adapter, cline, repliesToChat };
   };
   const plan = planFor(requestedModel);
-  // 这三个下游（响应转换 / 流式转换）要读，所以留在函数作用域里，降级成功后更新
+  // 这几个下游（响应转换 / 流式转换）要读，所以留在函数作用域里，降级成功后更新
   let customUp = plan.customUp;
   let bridge = plan.bridge;
   let ocAdapter = plan.ocAdapter;
+  let repliesToChat = plan.repliesToChat;
+  /** Responses 客户端 + 只会说 chat 的上游：出站要把中枢 chat 翻回 responses */
+  const responsesOut = () => (repliesToChat ? adapterFor('responses') : null);
 
   const callUpstream = (acct, p) => {
     const prov = providerOf(acct);
     if (prov === 'freebuff') return worker.fetch(makeRequest(p.modelId), buildEnv([acct.token], presented));
+    if (prov === 'cline') {
+      // 发给 Cline 的模型名不能带我们自己的 cline/ 前缀（引擎认的是 Cline 官方裸 id）
+      const bare = stripClinePrefix(p.modelId || parsed?.model || '');
+      // 入站 body → 中枢 chat。三种客户端协议在这里汇合，引擎那边只管 chat。
+      const chatBody = p.repliesToChat
+        ? adapterFor('responses').requestToChat(parsed || {}, bare)
+        : p.bridge === 'a2c'
+          ? anthropicToChat(parsed || {}, bare)
+          : { ...(parsed || {}), model: bare };
+      return clineWorker.fetch(clineChatRequest(chatBody), buildClineEnv([acct.token], presented));
+    }
     if (prov === 'opencode') {
       // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
       const bare = stripPrefix(p.modelId || parsed?.model || '');
@@ -713,12 +762,15 @@ async function dispatchApi(req, res, url) {
 
   // 模型列表和 count_tokens 都不碰上游、不占额度，不需要账号
   if (isModelList || isCountTokens) {
-    // Zen 没有 count_tokens 接口，模型 id 也不在 worker 的表里（丢给它会被判无效模型），
-    // 所以 opencode 的模型自己在本地粗算一个数
-    if (isCountTokens && parsed?.model && isOpencodeModel(resolveModelId(String(parsed.model), true))) {
-      store.touchKey(keyRecord.id);
-      send(res, 200, countTokensReply(parsed), { 'request-id': `req_${randomId(12)}` });
-      return;
+    // opencode / cline 都没有 count_tokens 接口，模型 id 也不在 freebuff 引擎的表里
+    // （丢给它会被判无效模型），所以这两家的模型自己在本地粗算一个数
+    if (isCountTokens && parsed?.model) {
+      const ctModel = resolveModelId(String(parsed.model), true);
+      if (isOpencodeModel(ctModel) || isClineModel(ctModel)) {
+        store.touchKey(keyRecord.id);
+        send(res, 200, countTokensReply(parsed), { 'request-id': `req_${randomId(12)}` });
+        return;
+      }
     }
     const resp = await worker.fetch(makeRequest(), buildEnv([], presented));
     const text = await resp.text();
@@ -728,7 +780,12 @@ async function dispatchApi(req, res, url) {
     } catch {}
     if (isModelList && Array.isArray(payload?.data)) {
       // 所有上游的模型合成一张表对外给出去
-      payload.data = filterModelList(keyRecord, [...payload.data, ...opencodeModelList(), ...customModelList()]);
+      payload.data = filterModelList(keyRecord, [
+        ...payload.data,
+        ...opencodeModelList(),
+        ...clineModelList(),
+        ...customModelList(),
+      ]);
     }
     store.touchKey(keyRecord.id);
     if (payload) {
@@ -758,17 +815,21 @@ async function dispatchApi(req, res, url) {
   if (!order.length) {
     const tier = requestedModel ? tierOf(requestedModel) : 'free';
     const wantOpencode = requestedModel && isOpencodeModel(requestedModel);
+    const wantCline = requestedModel && isClineModel(requestedModel);
     let hint;
     if (wantOpencode && !store.accounts.some((a) => providerOf(a) === 'opencode')) {
       hint = tier === 'paid'
         ? '这是 opencode Zen 的付费模型，必须先在控制台添加一个 opencode 号（去 https://opencode.ai/zen 登录后复制 API key）'
         : '号池里没有 opencode 账号，而匿名模式是关着的（OPENCODE_ANONYMOUS=false）：去控制台添加一个 opencode 号';
+    } else if (wantCline && !store.accounts.some((a) => providerOf(a) === 'cline')) {
+      hint = '号池里没有 Cline 账号：去控制台「账号池」添一个（可以用 WorkOS 设备码登录拿 refreshToken，也可以直接粘贴）';
     } else if (!store.accounts.length) hint = '账号池是空的，先去控制台添加账号';
     else if (manual)
       hint = eligible.length
         ? '手动模式下还没指定要用哪个账号（或者指定的账号不能用于这个模型），去控制台「账号池」点「设为当前」'
         : '手动模式下指定的账号已停用或不能承接这个模型，去控制台换一个';
     else if (wantOpencode) hint = 'opencode 号都被停用或已标记失效了，去控制台看看账号状态';
+    else if (wantCline) hint = 'Cline 号都被停用或已标记失效了，去控制台看看账号状态';
     else if (tier === 'paid') hint = '没有能承接付费(Premium)模型的账号：检查账号的「用途」是不是被限制成了仅免费';
     else hint = '账号池里没有可用账号（可能都被停用或已标记失效）';
     track({ status: 503, ok: false, error: 'no_account' });
@@ -842,13 +903,14 @@ async function dispatchApi(req, res, url) {
         // 才进随机抢救期。acct.status 作为 prior 传进去，用来判断抢救期是否进行中
         // （进行中就不重置 retryCount，只把 retryAt 重新随机一次）。
         // 终态（token_invalid / banned）不加任何 recoverAt，免得看起来像会自己恢复。
+        // prov 一并传进去：探不了活的上游（cline）不进抢救期，直接按上游提示/原版兜底时长冷却。
         store.setAccountStatus(acct.id, failureStatus({
           state,
           verdict: FAILURE_TEXT[state] || '上游失败',
           detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
           quota: acct.status?.quota || '',
           source: 'request',
-        }, text, resp.status, acct.status));
+        }, text, resp.status, acct.status, prov));
       }
       last = { status: resp.status, text, acct, state };
       tried.push(`${acct.id}:${state}`);
@@ -904,6 +966,7 @@ async function dispatchApi(req, res, url) {
     customUp = usedPlan.customUp;
     bridge = usedPlan.bridge;
     ocAdapter = usedPlan.ocAdapter;
+    repliesToChat = usedPlan.repliesToChat;
   }
   if (!used.anonymous) {
     // 只有"钉住一个号"那两种策略才需要记指针：
@@ -976,6 +1039,9 @@ async function dispatchApi(req, res, url) {
       send(res, response.status, chatToAnthropic(payload, requestedModel), headers);
     } else if (payload && ok && bridge === 'c2a') {
       send(res, response.status, anthropicToChatResponse(payload, requestedModel), headers);
+    } else if (payload && ok && responsesOut()) {
+      // Responses 客户端 + 只会说 chat 的上游（cline）：中枢格式的响应翻回 responses
+      send(res, response.status, responsesOut().responseFromChat(payload, requestedModel), headers);
     } else if (payload && isAnthropic) {
       send(res, response.status, patchAnthropicMessage(payload), headers);
     } else if (payload) {
@@ -1011,7 +1077,9 @@ async function dispatchApi(req, res, url) {
         ? createAnthropicToChatStream(requestedModel)
         : isAnthropic
           ? createAnthropicStreamPatcher()
-          : null;
+          : responsesOut()
+            ? responsesOut().createStreamFromChat(requestedModel)
+            : null;
   const sniffer = createUsageSniffer({ collectText: wantChat });
   const decoder = new TextDecoder();
   const reader = response.body.getReader();

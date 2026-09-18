@@ -23,7 +23,7 @@ import {
   ROTATION_HINT,
 } from './upstreams.js';
 import { fetchUpstreamModels, probeUpstreamKey } from './protocols/index.js';
-import { startFlow, getFlow, cancelFlow, publicFlow, startOpencodeFlow, finishOpencodeFlow } from './login-flow.js';
+import { startFlow, getFlow, cancelFlow, publicFlow, startOpencodeFlow, finishOpencodeFlow, startClineFlow } from './login-flow.js';
 import { browserFeature, startBrowserForFlow, getSession } from './browser.js';
 import { usage } from './usage.js';
 import { chatLogStatus, chatLogFiles, recentChats, readChatLogFile, clearChatLog } from './chatlog.js';
@@ -147,11 +147,31 @@ function keyView(k) {
   };
 }
 
-/** 探活：每个上游的凭据格式和校验方式都不一样，按 provider 分流 */
-async function checkAccount(acct) {
+/**
+ * 探活：每个上游的凭据格式和校验方式都不一样，按 provider 分流。
+ *
+ * 返回值里可以带 `noProbe: true` —— 那表示"这个上游根本没有可用的只读探活端点"，
+ * **调用方不得把它写进账号状态**。cline 就是这种情况：原版的 /v1/health 不校验凭据、
+ * 只回一个账号数量，探了等于没探；真发一次聊天请求又会实打实消耗额度、还占它的
+ * 并发队列。所以这里只回一句说明，让用户自己决定要不要发一次真实请求去验证。
+ *
+ * 导出只为测试（`tests/unit.mjs` 里断言 cline 的结论不带 noProbe 之外的副作用）。
+ */
+export async function checkAccount(acct) {
   const prov = providerOf(acct);
   if (prov === 'opencode') return probeOpencodeKey(acct.token);
   if (prov === 'freebuff') return probeAccount(acct.token);
+  if (prov === 'cline') {
+    return {
+      state: 'unknown',
+      noProbe: true,
+      verdict: '不支持探活',
+      detail:
+        'Cline 没有 0 消耗的探活端点（原版 cline2api 也只有不校验凭据的 /v1/health）。' +
+        '账号状态由真实请求的结果判定；想验证这个号，直接发一次请求最快。',
+      httpStatus: 0,
+    };
+  }
   const up = getUpstream(prov);
   if (!up) return { state: 'unknown', verdict: '上游已删除', detail: '这个号所属的上游不在了，删掉它吧', httpStatus: 0 };
   return probeUpstreamKey(up, acct.token);
@@ -176,7 +196,9 @@ async function checkAccounts(accounts) {
       const acct = accounts[i];
       try {
         const result = await checkAccount(acct);
-        store.setAccountStatus(acct.id, result);
+        // noProbe 的结果只是给用户看的一句说明，**不落库** —— 否则会把账号上真实的
+        // 状态（比如正在冷却）覆盖成一个毫无意义的 'unknown'。
+        if (!result.noProbe) store.setAccountStatus(acct.id, result);
         results.push({ id: acct.id, ...result });
       } catch (err) {
         // 单个号探活抛错不能带崩整批
@@ -469,8 +491,13 @@ export async function handleAdminApi(req, res, url) {
 
     if (acctMatch[2] === '/check' && method === 'POST') {
       const result = await checkAccount(acct);
-      store.setAccountStatus(id, result);
-      return sendJson(res, 200, { ok: true, status: store.accounts.find((a) => a.id === id).status });
+      // noProbe 的结论只是说明，不落库（否则会把真实的冷却状态盖成 'unknown'）
+      if (!result.noProbe) store.setAccountStatus(id, result);
+      return sendJson(res, 200, {
+        ok: true,
+        status: store.accounts.find((a) => a.id === id).status,
+        probe: result.noProbe ? { verdict: result.verdict, detail: result.detail } : null,
+      });
     }
     if (acctMatch[2] === '/activate' && method === 'POST') {
       if (!acct.enabled) return sendJson(res, 400, { ok: false, error: '这个账号是停用状态，先启用再设为当前' });
@@ -573,7 +600,8 @@ export async function handleAdminApi(req, res, url) {
     }
     let flow;
     try {
-      flow = await startFlow({ mode, pool: body.pool });
+      // cline 走 WorkOS 设备授权码，freebuff 走它自己的 CLI 授权码；两种都用同一套 flow 外壳
+      flow = provider === 'cline' ? await startClineFlow({ mode, pool: body.pool }) : await startFlow({ mode, pool: body.pool });
     } catch (err) {
       return sendJson(res, err.statusCode || 502, { ok: false, error: err.message });
     }

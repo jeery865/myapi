@@ -62,11 +62,30 @@ export const BUILTIN = {
     credentialLabel: 'Zen API key',
     defaultRotation: 'exhaust',
   },
+  cline: {
+    id: 'cline',
+    name: 'Cline',
+    builtin: true,
+    format: 'chat',
+    baseUrl: '',
+    note: '走随包引擎 vendor/cline-worker.js，凭据是 Cline 账号的 refreshToken',
+    credentialLabel: 'refreshToken',
+    defaultRotation: 'exhaust',
+  },
 };
 
 export function isBuiltin(id) {
   return Object.hasOwn(BUILTIN, String(id || ''));
 }
+
+/**
+ * 内置上游各自占着一个模型命名空间，自定义上游不能撞进来：
+ * `opencode/`、`cline/` 是那两家的前缀，`freebuff` 的模型是 `厂商/模型` 形态。
+ * 撞上就会有两个上游抢同一个模型 id，而 upstreamForModel 只会命中先建的那个 ——
+ * 后建的那个上游的模型永远调不通，报错还看不出原因。
+ * （slugOf 是下面定义的函数声明，会被提升，这里能用。）
+ */
+const BUILTIN_SLUGS = new Set(Object.keys(BUILTIN).map((id) => slugOf(id)));
 
 function customList() {
   if (!Array.isArray(store.data.upstreams)) store.data.upstreams = [];
@@ -149,8 +168,8 @@ export function slugOf(name) {
 
 function assertNameFree(label, exceptId) {
   const slug = slugOf(label);
-  // 前缀不能和内置上游撞：opencode/ 是 Zen 的命名空间，freebuff 的模型是 厂商/模型 形态
-  if (slug === 'opencode' || slug === 'freebuff') {
+  // 前缀不能和内置上游撞（opencode/ · cline/ 是那两家的命名空间）
+  if (BUILTIN_SLUGS.has(slug)) {
     throw Object.assign(new Error(`「${label}」和内置上游的名字冲突，换一个`), { statusCode: 400 });
   }
   const clash = customList().find((u) => u.id !== exceptId && slugOf(u.name) === slug);

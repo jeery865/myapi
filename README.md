@@ -94,7 +94,7 @@ freebuff 的免费模型对出口 IP 有美国限制，部在欧洲或亚洲区�
 
 ### 第 1 步：加账号
 
-主页点 **「+ 添加账号」**，四种方式挑一种（前三种是 freebuff，第四种是 opencode Zen）：
+主页点 **「+ 添加账号」**，先选上游，再按那个上游自己的方式录入（`① ② ③` 是 freebuff，`④` 是 opencode Zen，`⑤` 是 Cline）：
 
 | 方式 | 怎么用 | 什么时候用 |
 |---|---|---|
@@ -102,8 +102,9 @@ freebuff 的免费模型对出口 IP 有美国限制，部在欧洲或亚洲区�
 | **② 服务器内置浏览器** | 点「启动浏览器并打开登录页」→ 网页里出现服务器浏览器的画面 → 在画面里点按钮、用下面的输入框打字完成登录 | 你本地网络打不开上游、或者想让登录动作从服务器出口发生 |
 | **③ 手动粘贴 token** | 把已有的 `authToken` 贴进去，支持一次贴多行 | 从别的部署 / `extract_freebuff.py` 迁移过来 |
 | **④ opencode Zen** | 两条路：自己去 <https://opencode.ai/zen> 登录后复制 API key 粘进来；或者点「用内置浏览器登录」，在服务器浏览器的画面里登录，再把 key 复制到旁边的框 | 想用 Zen 那批免费模型（`mimo-v2.5-free`、`big-pickle`、`nemotron-*-free` 等） |
+| **⑤ Cline** | 三条路都拿到同一个 `refreshToken`：**设备码授权**（推荐，生成链接 + 设备码，你在手机上开链接授权）、**内置浏览器**、**手动粘贴** | 想用 Cline 那批免费模型（`cline/cline-free/deepseek-v4.1-flash` 等），详见下面「Cline 那半张表」 |
 
-加完可以点「检测」：freebuff 的号做 **0 消耗探活**（只读 `GET /api/v1/freebuff/session`，不创建 session、不扣额度）；opencode 的号用一个免费模型发 1 token 的最小请求探活（上游没有查余额的接口，这是唯一能确认 key 有效的办法）。两边都能看出存活 / key 失效 / 被封 / 地区受限 / 额度用完。
+加完可以点「检测」：freebuff 的号做 **0 消耗探活**（只读 `GET /api/v1/freebuff/session`，不创建 session、不扣额度）；opencode 的号用一个免费模型发 1 token 的最小请求探活（上游没有查余额的接口，这是唯一能确认 key 有效的办法）。两边都能看出存活 / key 失效 / 被封 / 地区受限 / 额度用完。**Cline 的号点「检测」只会回一句说明** —— 它没有 0 消耗的探活端点，状态得由真实请求来判定。
 
 **opencode 的号为什么没有"登录"按钮**：Zen 没有 CLI 授权码那一套。`/auth/*` 是浏览器回调端点（GET 会回 `500 No authorization code found.`），也没有 `oauth-authorization-server` 发现文档，官方文档写的流程就是"网页登录 → 复制 API key → 粘进客户端"。所以这里只能把登录页开给你，key 还是得你复制一下。
 
@@ -242,6 +243,25 @@ Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"
 - **401 不一定是 key 错了**：Zen 把余额耗尽、月度上限、模型被工作区管理员停用也都回 401。控制台按上游的 `error.type`（`AuthError` / `CreditsError` / `RegionError` / `FreeUsageLimitError` …）分类，不靠在正文里捞字符串。
 - **`GET /zen/v1/models` 免鉴权**，所以一个 Zen 号都没有也能拉到完整模型表；拉不到就退回随包的免费名单，不会让控制台里一个 opencode 模型都不剩。
 
+### Cline 那半张表
+
+`pingmike2/cline2api-workers` 那个单文件引擎被当作**随包引擎**接了进来（`vendor/cline-worker.js`，由 GitHub Actions 每天跟随上游更新，和 freebuff 的 `vendor/worker.js` 同一套机制）。用法和 freebuff 一样，只是在外面套了一层壳。
+
+| 项 | 说明 |
+|---|---|
+| **凭据** | Cline 账号的 **refreshToken**（不是 API key）。控制台「添加账号 → Cline」三条路任选：**设备码授权链接**（推荐，在你手机上开链接授权）、**服务器内置浏览器**（画面推到控制台里点）、**直接粘贴 refreshToken** |
+| **模型命名** | 统一加 `cline/` 前缀，例如 `cline/deepseek/deepseek-v4-flash`。**它和 freebuff 的 `deepseek/deepseek-v4-flash` 是两个不同的模型**，别混用；不带前缀的名字一律还是走 freebuff |
+| **免费** | `cline-free/*`（如 `cline/cline-free/deepseek-v4.1-flash`）、名字里带 `:free` 的，以及 `z-ai/glm-5.3-flash` 这类官方推荐免费模型。其余一律按**付费**处理 |
+| **付费** | `cline-pass/*` 需要订阅（上游直接 403）；其它模型按 Cline 账户余额计费。两者都得在 key 上勾「允许付费模型」 |
+
+**refreshToken 会自动续期，这条很重要。** Cline 每次刷新 accessToken 时会**签发一个新的 refreshToken 并作废旧的**，而新 token 默认只活在引擎的内存里。所以这里给引擎打了一条最小补丁（`src/vendor-patch.js` 的 `patchClineWorker`）：轮换一发生就把新 token 交回宿主，写进号池并落盘。**不打这条补丁的话，进程一重启我们就拿着旧 token 去刷新，上游回 `invalid_grant` —— 等于我们把自己的好号判死。** 补丁的锚点有测试盯着，上游哪天换了写法会变成测试失败，而不是悄悄失效。
+
+已知限制（都是照原版刻意保留的）：
+
+- **没有主动探活。** 原版的 `/v1/health` 只回一个账号数量、不校验凭据，探了等于没探；真发一次请求又会实打实消耗额度、还占它的并发队列。所以 Cline 号的状态**只由真实请求的结果驱动** —— 控制台里点「检测」只会给你一句说明，不会去改账号状态。
+- **失败后的冷却时长按原版兜底**：上游给了明确 `Try again in Xh Xm` 就按它写的排；没给的话，429/限流类 5 分钟、其它 60 秒（freebuff 那边是 30 分钟）。和 freebuff 不同的是，Cline **不进「快速抢救期」** —— 抢救期的意义是到点自动探一次，而 Cline 探不了，进去只会每 3 秒空跑。
+- **单个 Cline 上游的吞吐上限 ≈ 1.25 req/s。** 原版用一个全局串行队列 + 800ms 最小间隔，来规避免费通道"并发 > 1 就回空响应"的问题。这是有意的设计，本次没改 —— 号多也快不了，瓶颈在队列不在号池。
+
 ## 三点五、账号怎么切（五种策略，每个上游各设一套）
 
 **每个上游一套换号策略，互不干扰。** 在控制台「上游」那一页，每张卡上直接点：
@@ -260,7 +280,7 @@ Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"
 
 **批量改**：「上游」页右上角「批量设策略」，选一个策略 + 勾要套用的上游，一键应用。不勾就是全部。
 
-**每个上游各排各的队**：选号第一步先按"这个模型属于哪个上游"筛 —— `opencode/xxx` 只会落到 opencode 的号上，`my-relay/xxx` 只会落到那个自定义上游的号上。而且这一步在"全被标记失效时仍然放行"那条兜底逻辑**之前** —— 不然一边的号全挂了，兜底会把另一边的号捞过来，拿着错的凭据去撞上游。opencode 的免费模型还多一条：号池里一个 opencode 号都没有时，会退到 `public` 匿名凭证（`OPENCODE_ANONYMOUS=false` 可关），响应头会标 `x-myapi-rotation: anonymous`。每个响应都带 `x-myapi-provider`，能看出这一次走的是哪个上游。
+**每个上游各排各的队**：选号第一步先按"这个模型属于哪个上游"筛 —— `opencode/xxx` 只会落到 opencode 的号上，`cline/xxx` 只会落到 cline 的号上，`my-relay/xxx` 只会落到那个自定义上游的号上。而且这一步在"全被标记失效时仍然放行"那条兜底逻辑**之前** —— 不然一边的号全挂了，兜底会把另一边的号捞过来，拿着错的凭据去撞上游。opencode 的免费模型还多一条：号池里一个 opencode 号都没有时，会退到 `public` 匿名凭证（`OPENCODE_ANONYMOUS=false` 可关），响应头会标 `x-myapi-rotation: anonymous`。每个响应都带 `x-myapi-provider`，能看出这一次走的是哪个上游。
 
 > 从旧版本升上来的部署不用动：原来那个全局「自动切换账号」开关会按语义翻译成新策略 —— 开着＝「额度用完才换」，关掉＝「单号」，行为完全不变。
 
@@ -268,7 +288,7 @@ Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"
 
 ## 三点七、自定义上游（接任意 OpenAI / Anthropic / Gemini 兼容接口）
 
-除了内置的 freebuff 和 opencode，还能自己加任意多个上游。一个上游 = **接口地址 + 协议格式 + 一批 API key**。
+除了内置的 freebuff、opencode 和 cline，还能自己加任意多个上游。一个上游 = **接口地址 + 协议格式 + 一批 API key**。
 
 控制台「上游 → 添加上游」，填四样东西：
 

@@ -1081,5 +1081,171 @@ store.updateSettings({ accountFreezeMinutes: 30 });
   store.data.accounts = [];
 }
 
+// ───────────────────────────── cline 内置上游（随包引擎 · refreshToken 轮换 · cline/ 命名空间）
+// 对应设计规格书 _scratch/cline-upstream-design.md 的 §5 / §6 / §7 / §8 / §10。
+{
+  const { patchClineWorker, CLINE_ROTATE_MARK } = await import('../src/vendor-patch.js');
+  const clineMod = await import('../src/models-cline.js');
+  const models = await import('../src/models.js');
+  const { PROVIDERS, normalizeProvider, isProviderId, store: st } = await import('../src/store.js');
+  const { addUpstream, listUpstreams, BUILTIN } = await import('../src/upstreams.js');
+  const { checkAccount } = await import('../src/admin.js');
+  const as = await import('../src/account-status.js');
+  const sched = await import('../src/scheduler.js');
+
+  // §10.1 补丁锚点必须真的落在随包引擎里 —— 上游哪天改了写法，这里要变红，
+  // 而不是"轮换悄悄不再持久化"（那会让号在进程重启后被自己判死）。
+  const engineText = fsExtra.readFileSync(new URL('../vendor/cline-worker.js', import.meta.url), 'utf8');
+  eq('vendor/cline-worker.js 里含轮换回调标记', engineText.includes(CLINE_ROTATE_MARK), true);
+  // 补丁是"插一段"，标记在一次插入里出现两次（判 typeof + 调用）；
+  // 出现 4 次就说明被插了两遍 —— 那正是本项目踩过的 Edit 留残骸的形态。
+  eq('标记只来自一次插入（无重复残骸）', (engineText.match(/__clineWorkerOnRotate/g) || []).length, 2);
+
+  // §10.2 patchClineWorker：能插上、幂等、上游改写法时原样返回且不抛
+  const anchorText = [
+    'function f() {',
+    '  if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {',
+    '    account.refreshToken = data.data.refreshToken.trim();',
+    '  }',
+    '}',
+    '',
+  ].join('\n');
+  const p1 = patchClineWorker(anchorText);
+  eq('patchClineWorker: 锚点命中并插入', p1.ok === true && p1.changed === true, true);
+  eq('patchClineWorker: 插入后含标记', p1.text.includes(CLINE_ROTATE_MARK), true);
+  const p2 = patchClineWorker(p1.text);
+  eq('patchClineWorker: 幂等（第二次 changed=false）', p2.changed, false);
+  eq('patchClineWorker: 幂等（内容一字不变）', p2.text, p1.text);
+  // 构造"上游改了写法"：动锚点的**第一行**（改最后一行不会让三行锚点失配 ——
+  // 一开始就是栽在这个上：被替换的片段根本不在锚点里，replace 空转、测试假绿）。
+  const drifted = anchorText.replace(
+    '=== "string" && data.data.refreshToken.trim()',
+    '=== "string" && data.data?.refreshToken?.trim()'
+  );
+  eq('drift 样本确实已经不含锚点', drifted.includes('=== "string" && data.data.refreshToken.trim()'), false);
+  let threw = false;
+  let p3 = null;
+  try {
+    p3 = patchClineWorker(drifted);
+  } catch {
+    threw = true;
+  }
+  eq('patchClineWorker: 上游改写法时不抛', threw, false);
+  eq('patchClineWorker: 上游改写法时原样返回', p3.text, drifted);
+  eq('patchClineWorker: 上游改写法时 ok=false（吵出来，别静默）', p3.ok, false);
+
+  // §10.3 轮换回写：新 token 写回账号 + 立刻落盘；陌生 token 不建号
+  await import('../src/cline.js'); // 模块加载时自装轮换钩子
+  const OLD_RT = 'cline-old-refresh-token-0123456789';
+  const NEW_RT = 'cline-new-refresh-token-9876543210';
+  st.data.accounts = [
+    { id: 'cl1', email: 'cline@example.com', token: OLD_RT, provider: 'cline', pool: 'any', enabled: true, status: { state: 'throttled' } },
+  ];
+  st.saveNow();
+  globalThis.__clineWorkerOnRotate(OLD_RT, NEW_RT);
+  const cl1 = st.data.accounts.find((a) => a.id === 'cl1');
+  eq('轮换后内存里的 token 是新值', cl1.token, NEW_RT);
+  // 轮换是"同一把钥匙换了齿"，不是在换号：正在冷却的状态必须保留，
+  // 否则一个正在限流的号会被当成健康号重新拿去撞上游。
+  eq('轮换不改账号状态（冷却要保留）', cl1.status.state, 'throttled');
+  eq('轮换后新 token 已落盘', JSON.parse(fsExtra.readFileSync(cfg.dataFile, 'utf8')).accounts.find((a) => a.id === 'cl1').token, NEW_RT);
+  const acctCountBefore = st.data.accounts.length;
+  globalThis.__clineWorkerOnRotate('cline-token-not-in-pool-1234', 'cline-should-never-be-stored');
+  eq('陌生 token 轮换不会自动建号', st.data.accounts.length, acctCountBefore);
+  eq('陌生 token 不会写进任何账号', st.data.accounts.some((a) => a.token === 'cline-should-never-be-stored'), false);
+  // 旧 token 已经不在池里了（上一步被换掉了），再轮换一次同样不该有任何动作
+  globalThis.__clineWorkerOnRotate(OLD_RT, 'cline-another-ghost-token');
+  eq('用已作废的旧 token 回写也不会误伤别的账号', st.data.accounts.find((a) => a.id === 'cl1').token, NEW_RT);
+  st.data.accounts = [];
+  st.saveNow();
+
+  // §10.4 cline/ 前缀往返
+  eq('isClineModel 认前缀', clineMod.isClineModel('cline/deepseek/deepseek-v4-flash'), true);
+  eq('裸名不算 cline', clineMod.isClineModel('deepseek/deepseek-v4-flash'), false);
+  eq('stripClinePrefix 剥前缀', clineMod.stripClinePrefix('cline/deepseek/deepseek-v4-flash'), 'deepseek/deepseek-v4-flash');
+  eq('withClinePrefix 加前缀', clineMod.withClinePrefix('deepseek/deepseek-v4-flash'), 'cline/deepseek/deepseek-v4-flash');
+  eq('前缀往返不变', clineMod.stripClinePrefix(clineMod.withClinePrefix('deepseek/deepseek-v4-flash')), 'deepseek/deepseek-v4-flash');
+  eq('withClinePrefix 幂等', clineMod.withClinePrefix('cline/x/y'), 'cline/x/y');
+
+  // §10.5 路由：同名模型必须分得开（这是本次的防撞车关键）
+  eq('路由：cline/ 前缀 → cline', models.providerForModel('cline/deepseek/deepseek-v4-flash'), 'cline');
+  eq('路由：同名裸 id 仍归 freebuff', models.providerForModel('deepseek/deepseek-v4-flash'), 'freebuff');
+  eq('路由：z-ai/glm-5.3-flash 裸名仍归 freebuff', models.providerForModel('z-ai/glm-5.3-flash'), 'freebuff');
+  eq('resolveModelId 不会把 cline 模型掉进 freebuff 后缀匹配', models.resolveModelId('cline/deepseek/deepseek-v4-flash', true), 'cline/deepseek/deepseek-v4-flash');
+  eq('isKnownModel 认 cline 兜底快照里的模型', models.isKnownModel('cline/cline-free/deepseek-v4.1-flash'), true);
+  eq('clineModelList 全部带 cline/ 前缀', models.clineModelList().every((m) => m.id.startsWith('cline/')), true);
+  eq('clineModelList 的 owned_by 是 cline', models.clineModelList()[0]?.owned_by, 'cline');
+
+  // §10.6 档位（fail-closed：只在有明确证据时算免费）
+  eq('档位：cline-free → free', models.tierOf('cline/cline-free/deepseek-v4.1-flash'), 'free');
+  eq('档位：z-ai/glm-5.3-flash → free', models.tierOf('cline/z-ai/glm-5.3-flash'), 'free');
+  eq('档位：:free 后缀 → free', models.tierOf('cline/poolside/laguna-s-2.1:free'), 'free');
+  eq('档位：cline-pass/ → paid', models.tierOf('cline/cline-pass/glm-5.2'), 'paid');
+  eq('档位：没证据的新模型 fail-closed 成 paid', models.tierOf('cline/some/brand-new-model'), 'paid');
+  eq('cline-pass 判定', clineMod.isClinePassModel('cline/cline-pass/glm-5.2'), true);
+  eq('默认 cline 模型是引擎自己的免费默认值', clineMod.defaultClineModel(), 'cline/cline-free/deepseek-v4.1-flash');
+
+  // §10.7 不探活：返回说明性结论（noProbe），两个调用点据此**不写账号状态**
+  const clineProbe = await checkAccount({ id: 'cl9', token: 'c'.repeat(30), provider: 'cline' });
+  eq('cline 探活结论带 noProbe（= 别写状态）', clineProbe.noProbe, true);
+  eq('cline 探活结论说清「不支持」', clineProbe.verdict, '不支持探活');
+  st.data.accounts = [
+    { id: 'cl9', token: 'c'.repeat(30), provider: 'cline', enabled: true, status: { state: 'throttled', recoverAt: '2999-01-01T00:00:00.000Z' } },
+  ];
+  await checkAccount(st.data.accounts[0]);
+  eq('探活本身不改写账号状态', st.data.accounts[0].status.state, 'throttled');
+  eq('探活也不会给账号挂上 recoverAt 之外的字段', st.data.accounts[0].status.cooldownMs, undefined);
+  st.data.accounts = [];
+  st.saveNow();
+
+  // §10.8 枚举与命名守卫
+  eq('PROVIDERS 含 cline', PROVIDERS.includes('cline'), true);
+  eq('normalizeProvider("cline")', normalizeProvider('cline'), 'cline');
+  eq('isProviderId("cline")', isProviderId('cline'), true);
+  eq('BUILTIN 里有 cline', Boolean(BUILTIN.cline), true);
+  eq('cline 的凭据标签是 refreshToken', BUILTIN.cline.credentialLabel, 'refreshToken');
+  const upsBefore = listUpstreams().length;
+  let guardA = false;
+  try {
+    addUpstream({ name: 'cline', format: 'chat', baseUrl: 'https://example.com/v1' });
+  } catch {
+    guardA = true;
+  }
+  eq('自定义上游不许叫 cline', guardA, true);
+  let guardB = false;
+  try {
+    addUpstream({ name: '  CLINE ', format: 'chat', baseUrl: 'https://example.com/v1' });
+  } catch {
+    guardB = true;
+  }
+  eq('大小写 / 空格变体也拦住', guardB, true);
+  eq('拦下之后没有真的建出上游', listUpstreams().length, upsBefore);
+
+  // §8 失败映射：cline 不进「快速抢救期」（它探不了活，进去只会每 3 秒空跑），
+  // 直接按上游提示 / 原版兜底时长写 recoverAt。
+  const clineThrottle = as.failureStatus({ state: 'throttled', verdict: 'v', detail: 'd' }, 'HTTP 429', 429, null, 'cline');
+  eq('cline 无 hint → 不挂 retryAt（不进抢救期）', clineThrottle.retryAt, undefined);
+  eq('cline 无 hint → 写 recoverAt（能自己恢复）', typeof clineThrottle.recoverAt, 'string');
+  eq('cline 无 hint → 429/限流兜底 5 分钟（对齐原版）', clineThrottle.cooldownMs, 5 * 60 * 1000);
+  const clineNet = as.failureStatus({ state: 'network_error', verdict: 'v', detail: 'd' }, 'socket hang up', 0, null, 'cline');
+  eq('cline 其它瞬时失败兜底 60 秒（对齐原版）', clineNet.cooldownMs, 60 * 1000);
+  const clineHint = as.failureStatus({ state: 'throttled', verdict: 'v', detail: 'd' }, '{"retryAfterMs":3600000}', 429, null, 'cline');
+  eq('cline 上游给了明确 hint 时尊重上游（1 小时）', clineHint.cooldownMs, 3600000);
+  const fbThrottle = as.failureStatus({ state: 'throttled', verdict: 'v', detail: 'd' }, 'HTTP 429', 429, null, 'freebuff');
+  eq('对照：freebuff 无 hint 仍进抢救期（有 retryAt）', typeof fbThrottle.retryAt, 'string');
+  eq('对照：freebuff 不进抢救期以外的冷却（无 recoverAt）', fbThrottle.recoverAt, undefined);
+  eq('providerHasNoProbe(cline)=true', as.providerHasNoProbe('cline'), true);
+  eq('providerHasNoProbe(freebuff)=false', as.providerHasNoProbe('freebuff'), false);
+
+  // 常规复检也不该把 cline 号排进队列：复检对它们只会返回 null，
+  // 却会一直占着 batch 名额（号池一大就把能复检的 freebuff/opencode 号挤到队尾）。
+  st.data.accounts = [
+    { id: 'cl2', token: 'cline-token-1234567890', provider: 'cline', enabled: true, status: { state: 'throttled', recoverAt: new Date(Date.now() - 1000).toISOString() } },
+  ];
+  eq('cline 号不进常规复检队列（返 0）', await sched.recheckAccounts(), 0);
+  st.data.accounts = [];
+  st.saveNow();
+}
+
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

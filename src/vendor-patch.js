@@ -1,4 +1,8 @@
-// 对随包引擎 vendor/worker.js 做「下载后校正」。
+// 对随包引擎做「下载后校正」。目前管两个文件：
+//   vendor/worker.js       —— freebuff 引擎，按官方名单对齐 PAUSED_MODELS（见下）
+//   vendor/cline-worker.js —— cline 引擎，插一个 refreshToken 轮换回调（见文件末尾）
+// 两处都是「下载后由 scripts/update-worker.mjs 施加」，**绝不要手工改 vendor 下的文件** ——
+// 下次更新会被整个覆盖。
 //
 // 为什么需要这么一层：vendor/worker.js 原样引用上游，但上游有一处**手写且没有
 // 回收机制**的名单 —— PAUSED_MODELS。命中的模型会在引擎本地直接回
@@ -121,4 +125,54 @@ export function syncPausedModels(text, officialPaused) {
     removed,
     added,
   };
+}
+
+// ─────────────────────────── vendor/cline-worker.js 的补丁
+
+/**
+ * Cline 引擎的轮换回调锚点。逐字匹配，上游改了写法就匹配不到 —— 那就原样返回。
+ * **不要**放宽成"模糊匹配"：插错位置比不插更危险（那是在改别人的引擎）。
+ */
+const CLINE_ROTATE_ANCHOR = [
+  '  if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {',
+  '    account.refreshToken = data.data.refreshToken.trim();',
+  '  }',
+].join('\n');
+
+/** 打过补丁之后文件里必然出现的标记。测试靠它检测「上游漂移导致补丁静默失效」。 */
+export const CLINE_ROTATE_MARK = '__clineWorkerOnRotate';
+
+const CLINE_ROTATE_PATCHED = [
+  '  if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {',
+  '    const __myapiPrevRT = account.refreshToken;',
+  '    account.refreshToken = data.data.refreshToken.trim();',
+  '    // ── 本段由 src/vendor-patch.js 在每次 npm run update-worker 时插入，别手改 ──',
+  '    // [myapi-patch] Cline 刷新 accessToken 时会**签发新的 refreshToken 并作废旧的**，',
+  '    // 而新 token 只存在本模块的内存里、不落盘。宿主（src/cline.js）每请求注入的是',
+  '    // 自己库里的 token，进程一重启就会拿旧 token 来刷新 → invalid_grant → 把好号判死。',
+  '    // 所以这里把「旧 token → 新 token」交回宿主写回持久库。宿主要是不装钩子，',
+  '    // 这里什么都不做，行为与上游原版完全一致。',
+  '    if (typeof globalThis.' + CLINE_ROTATE_MARK + ' === "function") {',
+  '      try { globalThis.' + CLINE_ROTATE_MARK + '(__myapiPrevRT, account.refreshToken); } catch (__myapiE) {}',
+  '    }',
+  '  }',
+].join('\n');
+
+/**
+ * 给 vendor/cline-worker.js 插一个「refreshToken 轮换」回调。
+ *
+ * 定位不到锚点 → 返回 `{ text: 原文, changed: false, ok: false }`，
+ * **不抛异常也不阻断更新流程** —— 上游改了写法最多是"轮换不再持久化"（会退化成
+ * 进程重启后需要重新粘贴 refreshToken），不该因此让整个 vendor 更新失败。
+ * 但这件事**必须吵**：`tests/unit.mjs` 里有一条断言 `vendor/cline-worker.js` 里
+ * 存在 CLINE_ROTATE_MARK，漂移会直接变成测试失败，不会静默溜过去。
+ *
+ * 幂等：已经打过补丁就原样返回（changed=false）。输出确定性，不含时间戳 ——
+ * 否则每次跑 update-worker 都判定"内容变了"，"已是最新"永远不成立。
+ */
+export function patchClineWorker(text) {
+  if (typeof text !== 'string') return { text, changed: false, ok: false };
+  if (text.includes(CLINE_ROTATE_MARK)) return { text, changed: false, ok: true };
+  if (!text.includes(CLINE_ROTATE_ANCHOR)) return { text, changed: false, ok: false };
+  return { text: text.replace(CLINE_ROTATE_ANCHOR, CLINE_ROTATE_PATCHED), changed: true, ok: true };
 }

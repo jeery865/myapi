@@ -10,14 +10,15 @@ import { randomId, generateApiKey, nowIso, constantTimeEqual } from './util.js';
 const scryptAsync = promisify(scrypt);
 const CURRENT_VERSION = 1;
 
-// 内置上游。'freebuff' 走 vendor/worker.js，'opencode' 直连 opencode.ai/zen。
-// 除这两个之外，用户还能在控制台加任意多个自定义上游（见 src/upstreams.js），
+// 内置上游。'freebuff' 走 vendor/worker.js，'opencode' 直连 opencode.ai/zen，
+// 'cline' 走 vendor/cline-worker.js（凭据是 Cline 账号的 refreshToken）。
+// 除这三个之外，用户还能在控制台加任意多个自定义上游（见 src/upstreams.js），
 // 它们的 id 形如 'up_xxxx'，也会出现在 account.provider 上。
-export const PROVIDERS = ['freebuff', 'opencode'];
+export const PROVIDERS = ['freebuff', 'opencode', 'cline'];
 
 const CUSTOM_ID_RE = /^up_[a-f0-9]{8}$/;
 
-/** 这个字符串能不能当 provider 用（内置的两个，或者自定义上游的 id 形状） */
+/** 这个字符串能不能当 provider 用（内置的三个，或者自定义上游的 id 形状） */
 export function isProviderId(value) {
   const p = String(value || '');
   return PROVIDERS.includes(p) || CUSTOM_ID_RE.test(p);
@@ -364,6 +365,27 @@ class Store {
       this.data.settings.activeAccountId = null;
     }
     this.save();
+    return acct;
+  }
+
+  /**
+   * 上游把凭据轮换了（Cline 刷新 accessToken 时会签发新 refreshToken 并作废旧的）。
+   *
+   * 单独开一个方法而不是复用 updateAccount，有两个必须的理由：
+   *   1. updateAccount 改 token 时会把 status 清成 null —— 那是"用户换了一个号"的语义；
+   *      轮换只是同一把钥匙换了齿，账号状态（比如还在冷却中）必须原样保留，
+   *      否则一个正在限流的号会被我们误当成健康号重新拿去撞。
+   *   2. 轮换发生在请求处理中途，必须**立刻落盘**：这时候进程随时可能被 Railway 重启，
+   *      丢掉的旧 token 已经作废了，重启后那个号就再也刷不出 accessToken。
+   */
+  rotateAccountToken(id, token) {
+    const clean = String(token || '').trim();
+    if (clean.length <= 8) return null;
+    const acct = this.data.accounts.find((a) => a.id === id);
+    if (!acct || acct.token === clean) return null;
+    acct.token = clean;
+    acct.updatedAt = nowIso();
+    this.saveNow();
     return acct;
   }
 

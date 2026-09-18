@@ -2,11 +2,20 @@
 // 把 vendor/ 下的上游文件更新到最新（上游是单文件引擎，本项目不改它，只在外面套壳）。
 // 用法: npm run update-worker
 //
-// 例外：worker.js 下载后会做一处**校正**——把引擎那份手写的 PAUSED_MODELS 按官方
-// FREEBUFF_PAUSED_FREE_MODEL_IDS 整体对齐（详见下方 syncPaused）。上游那份名单没有
-// 回收机制：恢复上架的条目会一直留着、把请求在引擎本地拦掉，而新撤下的又不会补进来。
-// 只靠升级引擎修不好，因为上游自己也还带着那条残留。
-// 对齐是双向的（放开 + 拦住），且拿不到官方名单时不动文件。
+// 两个目标仓库、三个文件：
+//   freebuff2api-wokers/worker.js             → vendor/worker.js
+//   freebuff2api-wokers/freebuff-models.json  → vendor/freebuff-models.json
+//   cline2api-workers/worker.js               → vendor/cline-worker.js
+//
+// 例外：下载后会做「校正」（都放在 src/vendor-patch.js 里，因为 vendor 下的文件
+// 每次都会被整个覆盖，手工改动留不住）：
+//   1. worker.js —— 把引擎那份手写的 PAUSED_MODELS 按官方 FREEBUFF_PAUSED_FREE_MODEL_IDS
+//      整体对齐（详见下方 syncPaused）。上游那份名单没有回收机制：恢复上架的条目会一直
+//      留着、把请求在引擎本地拦掉，而新撤下的又不会补进来。只靠升级引擎修不好，因为
+//      上游自己也还带着那条残留。对齐是双向的（放开 + 拦住），拿不到官方名单时不动文件。
+//   2. cline-worker.js —— 插一个 refreshToken 轮换回调（详见 patchClineWorker）。Cline
+//      刷新 accessToken 时会签发新的 refreshToken 并作废旧的，而新的只留在引擎内存里；
+//      不交回宿主落盘，进程一重启就会拿旧 token 去刷新、把好号判死。
 //
 // 每个目标都有多个镜像 + 重试 + 校验：以前只试一个地址、没超时也没重试，
 // 网络抖一下就报"更新失败"，然后你以为已经是最新了。
@@ -14,10 +23,12 @@ import { writeFile, readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchOfficialTable } from '../src/model-source.js';
-import { syncPausedModels } from '../src/vendor-patch.js';
+import { syncPausedModels, patchClineWorker } from '../src/vendor-patch.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO = 'pingmike2/freebuff2api-wokers';
+// cline 的引擎是另一个仓库（同一个作者），结构同形：单文件 Cloudflare Worker。
+const CLINE_REPO = 'pingmike2/cline2api-workers';
 
 const TARGETS = [
   {
@@ -58,6 +69,34 @@ const TARGETS = [
     finalize: async (text, before) => {
       const repaired = await repairPools(text);
       return keepFresher(repaired, before) ?? repaired;
+    },
+  },
+  {
+    file: 'vendor/cline-worker.js',
+    urls: [
+      `https://raw.githubusercontent.com/${CLINE_REPO}/main/worker.js`,
+      `https://cdn.jsdelivr.net/gh/${CLINE_REPO}@main/worker.js`,
+    ],
+    check(text) {
+      if (!text.includes('export default')) return '没有 export default，不像 worker.js';
+      if (!/const VERSION = "/.test(text)) return '找不到 VERSION 常量';
+      // 少了这个就等于换了个上游，别把文件写坏
+      if (!text.includes('CLINE_REFRESH_TOKEN')) return '找不到 CLINE_REFRESH_TOKEN，不像 cline 引擎';
+      if (text.length < 20000) return `内容太短（${text.length}B）`;
+      return null;
+    },
+    describe: (text) => (text.match(/const VERSION = "([^"]+)"/) || [])[1] || '?',
+    finalize: async (text) => {
+      const { text: patched, changed, ok } = patchClineWorker(text);
+      if (!ok) {
+        console.warn('! cline 引擎里没找到 refreshToken 轮换的锚点，这次没打补丁');
+        console.warn('  后果：Cline 轮换 refreshToken 后我们不会把它写回库，进程重启后');
+        console.warn('  那个号会拿旧 token 刷新、被判成 invalid_grant。请检查上游是不是改了写法，');
+        console.warn('  并更新 src/vendor-patch.js 的锚点（tests/unit.mjs 里有一条断言会先失败）。');
+        return text;
+      }
+      if (changed) console.log('  · cline 引擎已插入 refreshToken 轮换回调');
+      return patched;
     },
   },
 ];

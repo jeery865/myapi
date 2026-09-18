@@ -25,6 +25,18 @@ import {
   nativeProtocol,
 } from './models-opencode.js';
 import { fetchOpencodeModels } from './opencode.js';
+import {
+  buildClineCatalog,
+  isClineModel,
+  isFreeClineModel,
+  clineNote,
+  clineDisplayName,
+  stripClinePrefix,
+  withClinePrefix,
+  CLINE_PREFIX,
+  defaultClineModel,
+} from './models-cline.js';
+import { clineModelIds } from './cline.js';
 import { listUpstreams, getUpstream, slugOf } from './upstreams.js';
 
 // ─────────────────────────── 自定义上游的模型
@@ -180,6 +192,39 @@ async function refreshOpencode() {
   return true;
 }
 
+// cline 的模型表：id（带 cline/ 前缀）-> 条目。
+// 来源是**随包引擎自己的** GET /v1/models（引擎内部会拉 Cline 官方、10 分钟缓存、
+// 失败回退它内置的 7 条）。先用内置兜底快照垫底，刷新成功再覆盖 ——
+// 和 opencode 那半张表一个套路。
+let clineTable = new Map(buildClineCatalog(null).map((m) => [m.id, m]));
+let clineLastRefresh = 0;
+
+/** cline 那半张表（控制台和门禁都从这里读） */
+export function clineEntry(modelId) {
+  return clineTable.get(withClinePrefix(stripClinePrefix(modelId))) || null;
+}
+
+export function hasClineModel(modelId) {
+  return clineTable.has(withClinePrefix(stripClinePrefix(modelId)));
+}
+
+/**
+ * cline 那张表是不是真从引擎拉下来的。
+ * 拉不到时表里只有内置兜底快照，这时候不能拿"表里没有"当"模型不存在" ——
+ * 否则一次网络抖动就会让几百个 Cline 模型集体 404。
+ */
+export function clineTableIsLive() {
+  return clineLastRefresh > 0;
+}
+
+async function refreshCline() {
+  const ids = await clineModelIds();
+  if (!ids?.length) return false;
+  clineTable = new Map(buildClineCatalog(ids).map((m) => [m.id, m]));
+  clineLastRefresh = Date.now();
+  return true;
+}
+
 function normalize(raw, source) {
   const pools = raw?.pools || {};
   const premium = new Set(pools.premium || []);
@@ -239,8 +284,9 @@ export async function refreshCatalog(force = false) {
   if (!force && Date.now() - lastRefresh < REFRESH_MS) return table;
   if (refreshing) return refreshing;
   refreshing = (async () => {
-    // opencode 那半张表和 freebuff 互不影响，一起刷，谁失败都不拖累对方
+    // opencode / cline 那两半张表和 freebuff 互不影响，一起刷，谁失败都不拖累对方
     refreshOpencode().catch(() => {});
+    refreshCline().catch(() => {});
     // 先试官方常量源码：它是第三方那份 JSON 的上游，没有"等人生成"的延迟
     try {
       const official = await fetchOfficialTable();
@@ -282,6 +328,10 @@ export function tierOf(modelId) {
   if (override === 'free' || override === 'paid') return override;
   // opencode Zen：免费/付费是上游明码标价的，按它自己的名单判
   if (isOpencodeModel(modelId)) return isFreeOpencodeModel(modelId) ? 'free' : 'paid';
+  // cline：免费通道（cline-free / :free / 明确名单）算免费，其余一律当付费。
+  // fail-closed —— 判错的代价是单向的：漏判一个真免费的最多是用不了（可接受），
+  // 误判一个付费成免费就是拿别人账户的余额去烧（不可接受）。
+  if (isClineModel(modelId)) return isFreeClineModel(modelId) ? 'free' : 'paid';
   // 自定义上游：整个上游一个默认档（用户自己知道那个 key 要不要钱）
   const custom = customEntry(modelId);
   if (custom) return custom.tier;
@@ -292,9 +342,12 @@ export function tierOf(modelId) {
   return 'paid';
 }
 
-/** 这个模型该找哪个上游？'opencode' | 'freebuff' | 'up_xxxx' */
+/** 这个模型该找哪个上游？'opencode' | 'cline' | 'freebuff' | 'up_xxxx' */
 export function providerForModel(modelId) {
+  // 两个带命名空间前缀的内置上游必须先判，而且必须在自定义上游索引之前 ——
+  // cline 的 `deepseek/deepseek-v4-flash` 和 freebuff 的同名，不加前缀根本分不开。
   if (isOpencodeModel(modelId)) return 'opencode';
+  if (isClineModel(modelId)) return 'cline';
   const u = upstreamForModel(modelId);
   if (u) return u.id;
   return 'freebuff';
@@ -302,6 +355,7 @@ export function providerForModel(modelId) {
 
 export function isKnownModel(modelId) {
   if (isOpencodeModel(modelId)) return hasOpencodeModel(modelId);
+  if (isClineModel(modelId)) return hasClineModel(modelId);
   if (upstreamForModel(modelId)) return true;
   return table.models.has(modelId);
 }
@@ -323,6 +377,7 @@ export function isLimitedOffer(modelId) {
 
 export function noteOf(modelId) {
   if (isOpencodeModel(modelId)) return opencodeNote(modelId);
+  if (isClineModel(modelId)) return clineNote(modelId);
   const custom = customEntry(modelId);
   if (custom) {
     const u = getUpstream(custom.upstreamId);
@@ -489,6 +544,23 @@ export function availabilityOf(modelId) {
     if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
     return { state: 'listed', detail: 'opencode Zen 上游列表里有它（还没实测过）', at: null };
   }
+  if (isClineModel(modelId)) {
+    const entry = clineEntry(modelId);
+    const st = store.modelStatus?.[modelId];
+    if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
+    // 表没拉下来时（只有内置兜底快照）不能说"不在列表里"—— 一次网络抖动就会让
+    // 几百个模型集体被藏掉。只有真拉到过、而且确实不在里面，才说得准。
+    if (!entry) {
+      return clineTableIsLive()
+        ? { state: 'unverified', detail: '不在 Cline 当前的模型列表里', at: null }
+        : { state: 'listed', detail: 'Cline 模型列表还没拉到（只加载了内置兜底名单）', at: null };
+    }
+    if (entry.pass) {
+      return { state: 'listed', detail: '需要 Cline 付费订阅（cline-pass）：没订阅的号调它会回 403', at: null };
+    }
+    if (entry.free) return { state: 'listed', detail: '在 Cline 官方免费通道里（还没实测过）', at: null };
+    return { state: 'listed', detail: '在 Cline 模型列表里，按账户余额计费（还没实测过）', at: null };
+  }
   // 官方已撤下：这是硬事实，优先于下面"引擎列表里没有它"那种软提示
   if (isPausedByOfficial(modelId)) {
     return { state: 'withdrawn', detail: officialPausedMessage(modelId), at: null };
@@ -518,42 +590,53 @@ export function availabilityOf(modelId) {
 export function catalog(extraIds = []) {
   const custom = customCatalog();
   const customById = new Map(custom.map((m) => [m.id, m]));
-  const ids = new Set([...table.models.keys(), ...extraIds, ...ocTable.keys(), ...customById.keys()]);
+  const ids = new Set([
+    ...table.models.keys(),
+    ...extraIds,
+    ...ocTable.keys(),
+    ...clineTable.keys(),
+    ...customById.keys(),
+  ]);
   const disabled = new Set(store.settings?.disabledModels || []);
-  // 上游展示顺序：内置两个在前，自定义按名字排
+  // 上游展示顺序：内置三个在前，自定义按名字排
   const order = new Map(listUpstreams().map((u, i) => [u.id, i]));
   return [...ids]
     .map((id) => {
       const oc = isOpencodeModel(id) ? opencodeEntry(id) : null;
+      const cl = isClineModel(id) ? clineEntry(id) : null;
       const cu = customById.get(id) || null;
       return {
         id,
-        provider: oc ? 'opencode' : cu ? cu.upstreamId : 'freebuff',
-        providerName: oc ? 'opencode Zen' : cu ? cu.upstreamName : 'freebuff',
+        provider: oc ? 'opencode' : cl ? 'cline' : cu ? cu.upstreamId : 'freebuff',
+        providerName: oc ? 'opencode Zen' : cl ? 'Cline' : cu ? cu.upstreamName : 'freebuff',
         tier: tierOf(id),
         pool: oc
           ? oc.free
             ? 'zen-free'
             : 'zen-paid'
-          : cu
-            ? cu.format
-            : table.premium.has(id)
-              ? 'premium'
-              : table.glm.has(id)
-                ? 'glm'
-                : table.standard.has(id)
-                  ? 'standard'
-                  : 'unknown',
+          : cl
+            ? cl.free
+              ? 'cline-free'
+              : 'cline-paid'
+            : cu
+              ? cu.format
+              : table.premium.has(id)
+                ? 'premium'
+                : table.glm.has(id)
+                  ? 'glm'
+                  : table.standard.has(id)
+                    ? 'standard'
+                    : 'unknown',
         note: noteOf(id),
         agent: table.models.get(id)?.agent || '',
         enabled: !disabled.has(id),
         overridden: Boolean(store.settings?.modelTierOverrides?.[id]),
         availability: availabilityOf(id),
-        limitedOffer: oc ? false : isLimitedOffer(id),
-        deepseekFamily: oc || cu ? false : isDeepSeekFamily(id),
-        displayName: oc ? oc.displayName : cu ? cu.bare : table.models.get(id)?.displayName || '',
-        upstreamAvailability: oc || cu ? '' : table.models.get(id)?.availability || '',
-        closedWindowUtc: oc || cu ? '' : table.models.get(id)?.closedWindowUtc || '',
+        limitedOffer: oc || cl ? false : isLimitedOffer(id),
+        deepseekFamily: oc || cl || cu ? false : isDeepSeekFamily(id),
+        displayName: oc ? oc.displayName : cl ? cl.displayName : cu ? cu.bare : table.models.get(id)?.displayName || '',
+        upstreamAvailability: oc || cl || cu ? '' : table.models.get(id)?.availability || '',
+        closedWindowUtc: oc || cl || cu ? '' : table.models.get(id)?.closedWindowUtc || '',
       };
     })
     .sort((a, b) => {
@@ -576,6 +659,7 @@ export function catalogMeta() {
     // 官方「已撤下」名单的状态：known=false 说明这次没解析到（此时不拦任何模型）
     paused: { known: Boolean(table.pausedKnown), count: table.paused.size, ids: [...table.paused] },
     opencode: { count: ocTable.size, lastRefresh: ocLastRefresh },
+    cline: { count: clineTable.size, lastRefresh: clineLastRefresh },
     custom: { count: customCatalog().length },
   };
 }
@@ -608,15 +692,21 @@ function warnIfDefaultWithdrawn(configured) {
  * hasFreebuff=false（池子里只有 opencode 号）时改挑 opencode 的免费模型，
  * 否则不带 model 的请求会被送去 freebuff 然后因为没号直接 503。
  */
-export function defaultModel({ hasFreebuff = true } = {}) {
+export function defaultModel({ hasFreebuff = true, hasOpencode = true, hasCline = false } = {}) {
   const configured = store.settings?.defaultModel;
-  if (configured && (table.models.has(configured) || hasOpencodeModel(configured))) {
+  if (configured && (table.models.has(configured) || hasOpencodeModel(configured) || hasClineModel(configured))) {
     // 仍然照用户指定的返回（不悄悄换成别的模型 —— 那正是"你以为在用 A 其实拿的是 B"），
     // 但要把"这个默认已经死了"喊出来
     warnIfDefaultWithdrawn(configured);
     return configured;
   }
-  if (!hasFreebuff) return defaultOpencodeModel();
+  // 池子里没有 freebuff 号就换一家有号的：否则不带 model 的请求必然 503。
+  // hasOpencode 默认 true 是为了不改变既有调用方的行为（旧签名只有 hasFreebuff）。
+  if (!hasFreebuff) {
+    if (hasOpencode) return defaultOpencodeModel();
+    if (hasCline) return defaultClineModel();
+    return DEFAULT_MODEL;
+  }
   const disabled = new Set(store.settings?.disabledModels || []);
   const free = [...table.standard]
     .filter(
@@ -654,6 +744,32 @@ export function checkModelAccess(keyRecord, modelId) {
         ok: false,
         status: 403,
         message: `模型 ${modelId} 是 opencode Zen 的按量计费模型（会真的扣你 Zen 账户余额）；当前 API key 没有勾选「允许付费模型」，请在控制台勾上或换用带 -free 的免费模型。`,
+      };
+    }
+    return { ok: true };
+  }
+  // cline 的模型同样不经过 freebuff 的引擎，PAUSED_MODELS 那一套跟它无关
+  if (isClineModel(modelId)) {
+    // 只有拿到过引擎真实列表时才敢说"这个模型不存在"（拉不到时表里只有内置兜底快照）
+    if (!hasClineModel(modelId) && clineTableIsLive()) {
+      return {
+        ok: false,
+        status: 404,
+        message: `模型 ${modelId} 不在 Cline 当前的模型列表里；GET /v1/models 是当前真正能用的列表`,
+      };
+    }
+    if (disabled.has(modelId)) return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
+    if (keyRecord?.models?.length && !keyRecord.models.includes(modelId)) {
+      return { ok: false, status: 403, message: `当前 API key 未授权模型 ${modelId}` };
+    }
+    if (tierOf(modelId) === 'paid' && !keyRecord?.allowPaid) {
+      const pass = clineEntry(modelId)?.pass;
+      return {
+        ok: false,
+        status: 403,
+        message: pass
+          ? `模型 ${modelId} 需要 Cline 付费订阅（cline-pass）；当前 API key 也没有勾选「允许付费模型」，请在控制台勾上或换用 cline-free 的免费模型。`
+          : `模型 ${modelId} 按 Cline 账户余额计费；当前 API key 没有勾选「允许付费模型」，请在控制台勾上或换用 cline-free 的免费模型。`,
       };
     }
     return { ok: true };
@@ -769,6 +885,13 @@ export function resolveModelId(raw, isAnthropic = false) {
     const full = withPrefix(stripPrefix(value));
     return ocTable.has(full) ? full : value;
   }
+  // 带 cline/ 前缀的：同理，只在 cline 那半张表里找。
+  // **不接受裸的 cline 模型名** —— cline 的 id 形态（`deepseek/deepseek-v4-flash`）
+  // 和 freebuff 完全一样，去掉前缀就没法区分是谁的，只能走前缀。
+  if (isClineModel(value)) {
+    const full = withClinePrefix(stripClinePrefix(value));
+    return clineTable.has(full) ? full : value;
+  }
   // 自定义上游的 `<上游>/<模型>`：命中就直接用，不要再往下做后缀匹配 ——
   // 否则一个叫 openai/gpt-4o 的自定义模型会被 freebuff 的后缀匹配抢走
   if (upstreamForModel(value)) return value;
@@ -802,6 +925,11 @@ export function filterModelList(keyRecord, list) {
       if (hideDead && OPENCODE_REGION_LOCKED.has(stripPrefix(id))) return false;
       return hasOpencodeModel(id);
     }
+    if (isClineModel(id)) {
+      // 和 opencode 同理：只有表里真有的才对外给。注意 cline 表拉不到时会退回
+      // 内置兜底快照，所以这里不会因为一次网络抖动就把全部 cline 模型藏掉。
+      return hasClineModel(id);
+    }
     const custom = customEntry(id);
     if (custom) {
       // 停用的上游根本不进索引，所以能查到就说明它是启用的
@@ -823,4 +951,9 @@ export function filterModelList(keyRecord, list) {
 /** 把 opencode 那半张表也变成 /v1/models 的条目 */
 export function opencodeModelList() {
   return [...ocTable.keys()].map((id) => ({ id, object: 'model', created: 0, owned_by: 'opencode' }));
+}
+
+/** cline 那半张表（注意：可能有几百个，见 models-cline.js 顶部关于暴露范围的说明） */
+export function clineModelList() {
+  return [...clineTable.keys()].map((id) => ({ id, object: 'model', created: 0, owned_by: 'cline' }));
 }

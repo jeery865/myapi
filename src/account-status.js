@@ -98,6 +98,35 @@ export function cooldownFor(state, text, status) {
  */
 const TRANSIENT_STATES = new Set(['throttled', 'rate_limited', 'ip_capped', 'model_locked', 'network_error', 'upstream_error', 'blocked']);
 
+/**
+ * 没有 0 消耗探活能力的上游。目前只有 cline：
+ * 原版 cline2api 只有一个 `/v1/health`（还不校验凭据、只报账号数量），
+ * 拿不到任何 per-account 的只读快照。
+ *
+ * 对这类上游，「快速抢救期」是**空转**：抢救期的全部意义就是"到点自动探一次"，
+ * 探不了就只能每 3 秒空跑一次、然后被 rescue-no-probe 分支立刻结束 ——
+ * 结果是账号状态上连一个 recoverAt 都没有，界面上永远是个消不掉的红黄灯
+ * （isStatusLive 对"没有 recoverAt 的状态"一律当有效），而选号会一直把它压在最后。
+ *
+ * 所以它们不进抢救期，直接按上游给的时长冷却：
+ *   - 上游给了明确 retry 提示 → 按提示（在 failureStatus 里已先行处理）
+ *   - 拿不到提示 → 用**原版自己的**兜底值：429 五分钟、其它 60 秒
+ *     （对齐参考项目 worker.js 的 parseCooldown）
+ * 想给新上游加进来之前，先确认它真的没有可用的只读探活端点。
+ */
+const NO_PROBE_PROVIDERS = new Set(['cline']);
+
+/** 这个 provider 是不是"探不了活"的那类（控制台/调度器也用它来决定要不要复检） */
+export function providerHasNoProbe(provider) {
+  return NO_PROBE_PROVIDERS.has(String(provider || ''));
+}
+
+/** 无探活上游的冷却兜底时长；返回 null 表示"这个上游能探活，别走这条路" */
+function fixedCooldownFor(provider, state) {
+  if (!providerHasNoProbe(provider)) return null;
+  return state === 'throttled' || state === 'rate_limited' ? 5 * 60 * 1000 : 60 * 1000;
+}
+
 export function withRecoverAt(status, text, httpStatus) {
   if (!status || typeof status !== 'object') return status;
   if (!TRANSIENT_STATES.has(status.state)) return status;
@@ -118,16 +147,27 @@ export function withRecoverAt(status, text, httpStatus) {
  *       已有进行中（prior.retryAt 还在未来）→ 不重置 retryCount，只把 retryAt 重新随机一次
  *       （避免后台主动探活和真实流量撞在一起把计数搅乱）。
  * accountRetryMax <= 0 视为「关闭抢救期」：退回旧行为（withRecoverAt，按 cooldownFor 写 recoverAt）。
+ *
+ * `provider` 用来分流"探不了活"的上游（见 NO_PROBE_PROVIDERS）：它们不进抢救期，
+ * 直接按上游提示或原版兜底时长写 recoverAt。抢救期和 accountRetryMax 对它们无意义。
  */
-export function failureStatus(status, text, httpStatus, prior = null) {
+export function failureStatus(status, text, httpStatus, prior = null, provider = '') {
   if (!TRANSIENT_STATES.has(status.state)) return status; // 终态：不写 recoverAt
-  const max = Number(store.settings?.accountRetryMax);
-  if (!Number.isFinite(max) || max <= 0) return withRecoverAt(status, text, httpStatus); // 抢救期关闭 → 旧行为
+  // 先看上游有没有明确提示（含"当日/每日额度用完"那个 15 分钟分支）。
+  // 注意这一步**不能**放在下面 max<=0 的判断之后：旧代码走的是 withRecoverAt → cooldownFor，
+  // 而 cooldownFor 第一件事也是 parseRetryAfterMs 并用同一个 clamp —— 两者等价，
+  // 提前到这里不改变任何既有行为，只是让"探不了活的"分支能排在前面。
   const hint = parseRetryAfterMs(text, httpStatus);
   if (hint !== null) {
     const ms = Math.min(Math.max(hint, 5 * 1000), 6 * 3600 * 1000);
     return { ...status, recoverAt: new Date(Date.now() + ms).toISOString(), cooldownMs: ms };
   }
+  const fixed = fixedCooldownFor(provider, status.state);
+  if (fixed !== null) {
+    return { ...status, recoverAt: new Date(Date.now() + fixed).toISOString(), cooldownMs: fixed };
+  }
+  const max = Number(store.settings?.accountRetryMax);
+  if (!Number.isFinite(max) || max <= 0) return withRecoverAt(status, text, httpStatus); // 抢救期关闭 → 旧行为
   const now = Date.now();
   const inRescue = Boolean(prior && prior.retryAt && Date.parse(prior.retryAt) > now);
   const retryCount = inRescue ? Number(prior.retryCount || 0) : 1;
