@@ -879,5 +879,207 @@ eq('官方名单没解析出来 → 不拦任何模型（fail-open）', mdl.chec
   eq('空列表的占位行不带 data-id（不会被绑事件）', Boolean(fallback) && !/data-id/.test(fallback[0]), true);
 }
 
+// ───────────────────────────── 快速抢救期（核心需求：transient 失败不再冻 30 分钟）
+// 设计定稿：失败不直接写 recoverAt，而是进「快速抢救期」——后台按 3s~180s 随机间隔
+// 主动探活，最多 accountRetryMax 次；用尽默认不冻结、放回常规复检；上游给明确时长 hint
+// 则尊重上游。下面这套测试只验证纯逻辑（failureStatus / advanceRescue / needsRecheck /
+// 随机窗口 / 设置校验），真实网络探活由 scheduler 的 3 秒 tick 调 advanceRescue 完成。
+const fsExtra = await import('node:fs');
+const { config: cfg } = await import('../src/config.js');
+
+// 随机窗口：边界 + 完全随机（绝不 flaky）
+eq('随机下限 rng=0 → 3000ms', as.randomRescueDelay(() => 0), 3000);
+eq('随机上限 rng≈1 → 180000ms', as.randomRescueDelay(() => 0.999999), 180000);
+eq('随机中点 rng=0.5 → 91500ms', as.randomRescueDelay(() => 0.5), 91500);
+{
+  const vals = Array.from({ length: 200 }, () => as.randomRescueDelay());
+  const inRange = vals.every((v) => v >= 3000 && v <= 180000);
+  const distinct = new Set(vals).size > 1;
+  eq('随机窗口全体在区间内 [3000,180000]', inRange, true);
+  // 用默认 Math.random 抽 200 个：全部撞同一个值的概率≈(1/177000)^199，可忽略。
+  // 只断言"存在差异"，不断言"等于某个数" —— 所以无论 RNG 怎么走都不会 flaky。
+  eq('多次调用结果不完全相同（真随机）', distinct, true);
+}
+
+// 默认值：三个新设置项
+eq('accountRetryMax 默认 5', store.data.settings.accountRetryMax, 5);
+eq('accountFreezeEnabled 默认 false', store.data.settings.accountFreezeEnabled, false);
+eq('accountFreezeMinutes 默认 30', store.data.settings.accountFreezeMinutes, 30);
+
+// failureStatus：真实请求失败回写时调用的入口（engine.js 失败处）
+{
+  const f = as.failureStatus({ state: 'throttled' }, 'too many requests', 429);
+  eq('transient 无 hint → 进抢救期（retryCount=1）', f.retryCount, 1);
+  eq('transient 无 hint → 挂 retryAt（未来）', Boolean(f.retryAt) && Date.parse(f.retryAt) > Date.now(), true);
+  eq('transient 无 hint → 不写 recoverAt', Object.hasOwn(f, 'recoverAt'), false);
+
+  const prior = { state: 'throttled', retryAt: new Date(Date.now() + 60000).toISOString(), retryCount: 3 };
+  const f2 = as.failureStatus({ state: 'throttled' }, 'too many requests', 429, prior);
+  eq('抢救进行中再失败 → 不重置 retryCount', f2.retryCount, 3);
+  eq('抢救进行中再失败 → 重新随机 retryAt（不同于旧的）', f2.retryAt !== prior.retryAt, true);
+
+  const priorDone = { state: 'throttled', retryAt: new Date(Date.now() - 1).toISOString(), retryCount: 3 };
+  const f3 = as.failureStatus({ state: 'throttled' }, 'too many requests', 429, priorDone);
+  eq('旧抢救期已过再失败 → 重开（retryCount=1）', f3.retryCount, 1);
+
+  const term = as.failureStatus({ state: 'token_invalid' }, 'unauthorized', 401);
+  eq('终态不进抢救期（保持 token_invalid）', term.state, 'token_invalid');
+  eq('终态不挂 retryAt', Object.hasOwn(term, 'retryAt'), false);
+
+  const hinted = as.failureStatus({ state: 'throttled' }, '429 retry-after: 300', 429);
+  eq('上游给 hint → 写 recoverAt（不进随机抢救）', Boolean(hinted.recoverAt), true);
+  eq('上游给 hint → 不挂 retryAt', Object.hasOwn(hinted, 'retryAt'), false);
+
+  // accountRetryMax=0 → 退回旧行为（withRecoverAt，按 cooldownFor 写 recoverAt）
+  store.data.settings.accountRetryMax = 0;
+  const off = as.failureStatus({ state: 'throttled' }, '', 429);
+  eq('关闭抢救期 → 按旧行为写 recoverAt', Boolean(off.recoverAt), true);
+  store.data.settings.accountRetryMax = 5;
+}
+
+// advanceRescue：后台 3 秒 tick 探活回来后推进抢救期（纯函数，不碰网络/落盘）
+{
+  const settings = { accountRetryMax: 5, accountFreezeEnabled: false, accountFreezeMinutes: 30 };
+  const ok = as.advanceRescue({ retryCount: 3, retryAt: 'x' }, { state: 'ok', httpStatus: 200 }, settings);
+  eq('探活成功 → retryCount 归零', ok.retryCount, 0);
+  eq('探活成功 → retryAt 清掉', ok.retryAt, null);
+
+  const cont = as.advanceRescue({ retryCount: 1, retryAt: 'x' }, { state: 'throttled' }, settings);
+  eq('未超上限 → 继续（retryCount 累加为 2）', cont.retryCount, 2);
+  eq('未超上限 → 重新挂未来 retryAt', Boolean(cont.retryAt) && Date.parse(cont.retryAt) > Date.now(), true);
+  eq('未超上限 → 不写 recoverAt', Object.hasOwn(cont, 'recoverAt'), false);
+
+  const hand = as.advanceRescue({ retryCount: 5, retryAt: 'x' }, { state: 'throttled' }, settings);
+  eq('超上限且未开冻结 → 交回常规复检（retryAt 清掉）', hand.retryAt, null);
+  eq('超上限且未开冻结 → 不冻结（无 recoverAt）', Object.hasOwn(hand, 'recoverAt'), false);
+
+  const frozen = as.advanceRescue({ retryCount: 5, retryAt: 'x' }, { state: 'throttled' }, { ...settings, accountFreezeEnabled: true, accountFreezeMinutes: 30 });
+  eq('超上限且开冻结 → 写 recoverAt', Boolean(frozen.recoverAt), true);
+  eq('超上限且开冻结 → 标记 frozen', frozen.frozen, true);
+  eq('超上限且开冻结 → 按时长写 cooldownMs=30min', frozen.cooldownMs, 30 * 60 * 1000);
+  eq('超上限且开冻结 → retryAt 清掉', frozen.retryAt, null);
+
+  const hintProbe = as.advanceRescue({ retryCount: 2, retryAt: 'x' }, { state: 'throttled', rawText: 'daily limit reached', httpStatus: 429 }, settings);
+  eq('探活拿到 hint → 尊重上游写 recoverAt（结束抢救）', Boolean(hintProbe.recoverAt), true);
+  eq('探活拿到 hint → 走 15 分钟阈值', hintProbe.cooldownMs, as.EXHAUSTED_THRESHOLD_MS);
+  eq('探活拿到 hint → 清掉 retryAt', hintProbe.retryAt, null);
+
+  // 设计 C 修正：hint 只从上游原文（rawText）挖，绝不拿我们自己的 detail 文案当证据。
+  // 上游原文含 retryAfterMs 长值 → 尊重它、写对应 recoverAt、结束抢救。
+  {
+    const retryProbe = as.advanceRescue(
+      { retryCount: 2, retryAt: 'x' },
+      { state: 'rate_limited', httpStatus: 429, rawText: '{"retryAfterMs": 15506639}' },
+      settings
+    );
+    eq('上游 retryAfterMs 长值 → 写 recoverAt（结束抢救）', Boolean(retryProbe.recoverAt), true);
+    eq('上游 retryAfterMs 长值 → recoverAt 落在未来', Date.parse(retryProbe.recoverAt) > Date.now(), true);
+    eq('上游 retryAfterMs 长值 → cooldownMs 等于该长值', retryProbe.cooldownMs, 15506639);
+    eq('上游 retryAfterMs 长值 → 清掉 retryAt（结束抢救）', retryProbe.retryAt, null);
+    eq('返回值不得含 rawText（防落盘）', Object.hasOwn(retryProbe, 'rawText'), false);
+  }
+
+  // 上游原文不含任何 hint（纯 "HTTP 429"），但 detail 里含我们自己写的"当天"文案 →
+  // 绝不能凭空造出 15 分钟 hint，必须继续随机重试。
+  {
+    const noHintProbe = as.advanceRescue(
+      { retryCount: 1, retryAt: 'x' },
+      { state: 'rate_limited', httpStatus: 429, detail: 'HTTP 429：当天 session 额度已用完，等重置', rawText: 'HTTP 429' },
+      settings
+    );
+    eq('上游无 hint → 不写 recoverAt（继续随机重试）', Object.hasOwn(noHintProbe, 'recoverAt'), false);
+    eq('上游无 hint → 继续挂未来 retryAt', Boolean(noHintProbe.retryAt) && Date.parse(noHintProbe.retryAt) > Date.now(), true);
+    eq('上游无 hint → retryCount 累加（1→2）', noHintProbe.retryCount, 2);
+    eq('返回值不得含 rawText（防落盘）', Object.hasOwn(noHintProbe, 'rawText'), false);
+  }
+
+  const termProbe = as.advanceRescue({ retryCount: 2, retryAt: 'x' }, { state: 'token_invalid', httpStatus: 401 }, settings);
+  eq('探活终态 → 直接落定（不进随机重试）', termProbe.state, 'token_invalid');
+  eq('探活终态 → 无 retryAt', termProbe.retryAt, null);
+}
+
+// needsRecheck：抢救期内排除，结束后恢复（设计 F）
+eq('抢救进行中（retryAt 未来）→ 不进常规复检', as.needsRecheck({ status: { state: 'throttled', retryAt: new Date(Date.now() + 60000).toISOString() } }), false);
+eq('抢救结束交回（retryAt 已清、无 recoverAt）→ 重新进常规复检', as.needsRecheck({ status: { state: 'throttled', retryCount: 0 } }), true);
+eq('冻结中（recoverAt 未来）→ 不进常规复检', as.needsRecheck({ status: { state: 'throttled', recoverAt: new Date(Date.now() + 60000).toISOString() } }), false);
+
+// 三个设置项的校验（照 accountRecheckMinutes 的链路）
+eq('accountRetryMax 越界(21) 被拒（保留 5）', store.updateSettings({ accountRetryMax: 21 }).accountRetryMax, 5);
+eq('accountRetryMax 合法(10) 可存', store.updateSettings({ accountRetryMax: 10 }).accountRetryMax, 10);
+eq('accountRetryMax 0 合法（= 关闭抢救期）', store.updateSettings({ accountRetryMax: 0 }).accountRetryMax, 0);
+store.updateSettings({ accountRetryMax: 5 });
+eq('accountFreezeEnabled 接受布尔 true', store.updateSettings({ accountFreezeEnabled: true }).accountFreezeEnabled, true);
+eq('accountFreezeEnabled 非布尔转布尔', store.updateSettings({ accountFreezeEnabled: 'yes' }).accountFreezeEnabled, true);
+store.updateSettings({ accountFreezeEnabled: false });
+eq('accountFreezeMinutes 越界(0) 被拒（保留 30）', store.updateSettings({ accountFreezeMinutes: 0 }).accountFreezeMinutes, 30);
+eq('accountFreezeMinutes 合法(60) 可存', store.updateSettings({ accountFreezeMinutes: 60 }).accountFreezeMinutes, 60);
+store.updateSettings({ accountFreezeMinutes: 30 });
+
+// 三个新字段收紧校验：只接受 number / 数字字符串，其余（null / 布尔 / 数组 / 对象 / "abc"）拒收保留原值
+eq('accountRetryMax: null 不悄悄变 0（保留原值 5）', store.updateSettings({ accountRetryMax: null }).accountRetryMax, 5);
+eq('accountRetryMax: true 不变成 1（保留原值 5）', store.updateSettings({ accountRetryMax: true }).accountRetryMax, 5);
+eq('accountRetryMax: [] 不变成 0（保留原值 5）', store.updateSettings({ accountRetryMax: [] }).accountRetryMax, 5);
+eq('accountRetryMax: "abc" 被拒（保留原值 5）', store.updateSettings({ accountRetryMax: 'abc' }).accountRetryMax, 5);
+eq('accountRetryMax: "10" 数字字符串可存', store.updateSettings({ accountRetryMax: '10' }).accountRetryMax, 10);
+store.updateSettings({ accountRetryMax: 5 });
+eq('accountFreezeEnabled: "false" 字符串 → false（不再被 Boolean 成 true）', store.updateSettings({ accountFreezeEnabled: 'false' }).accountFreezeEnabled, false);
+eq('accountFreezeEnabled: null 保留原值 false', store.updateSettings({ accountFreezeEnabled: null }).accountFreezeEnabled, false);
+store.updateSettings({ accountFreezeEnabled: false });
+eq('accountFreezeMinutes: true 不变成 1（保留原值 30）', store.updateSettings({ accountFreezeMinutes: true }).accountFreezeMinutes, 30);
+eq('accountFreezeMinutes: [] 不变成 0（保留原值 30）', store.updateSettings({ accountFreezeMinutes: [] }).accountFreezeMinutes, 30);
+eq('accountFreezeMinutes: "60" 数字字符串可存', store.updateSettings({ accountFreezeMinutes: '60' }).accountFreezeMinutes, 60);
+store.updateSettings({ accountFreezeMinutes: 30 });
+
+// §H 持久化：retryAt/retryCount 落在账号记录里、能落盘（重启恢复靠读同一份文件）
+{
+  store.data.accounts = [{ id: 'r1', token: 'tok-rescue-1234567890', provider: 'freebuff', pool: 'any', enabled: true, status: null }];
+  const future = new Date(Date.now() + 12345).toISOString();
+  store.setAccountStatus('r1', { state: 'throttled', retryAt: future, retryCount: 2 });
+  store.saveNow();
+  const onDisk = JSON.parse(fsExtra.readFileSync(cfg.dataFile, 'utf8'));
+  const rec = onDisk.accounts.find((a) => a.id === 'r1');
+  eq('retryAt 已落盘到账号记录', rec.status.retryAt, future);
+  eq('retryCount 已落盘到账号记录', rec.status.retryCount, 2);
+  // 复位，别带坏后面
+  store.data.accounts = store.data.accounts.filter((a) => a.id !== 'r1');
+  store.saveNow();
+}
+
+// §I 抢救期死锁回归（QA 证实）：provider 指向一个当前没注册的 upstream 时，账号会永久
+// 卡在抢救态（retryAt 永远停在过去、retryCount 不推进、needsRecheck 永不接管）。
+// 修复后：探活拿不到结论 → 立即结束抢救期、交回常规复检，retryAt 不再留在过去。
+{
+  const sched = await import('../src/scheduler.js');
+  const as = await import('../src/account-status.js');
+  const past = new Date(Date.now() - 60000).toISOString();
+
+  // 情形 A（QA 复现路径）：provider 是合法格式但未注册的 upstream id → probe 返回 null
+  store.data.accounts = [{
+    id: 'dl-null', token: 'tok-deadlock-null-1234567890', provider: 'up_deadbeef', pool: 'any', enabled: true,
+    status: { state: 'throttled', retryAt: past, retryCount: 2 },
+  }];
+  await sched.runRescueTick(); // 默认 probe：up_deadbeef 未注册 → probeAccountForRescue 返回 null
+  const aNull = store.data.accounts.find((a) => a.id === 'dl-null');
+  const raNull = aNull.status.retryAt ? Date.parse(aNull.status.retryAt) : null;
+  const notPastNull = raNull === null || raNull > Date.now();
+  eq('死锁A：未注册upstream，跑完一轮后 retryAt 不再是过去', notPastNull, true);
+  eq('死锁A：needsRecheck 接管（=== true）', as.needsRecheck(aNull), true);
+
+  // 情形 B：探活返回「无 state 结果」→ 同一分支（!result.state）也该结束抢救期
+  store.data.accounts = [{
+    id: 'dl-nostate', token: 'tok-deadlock-nostate-1234567890', provider: 'freebuff', pool: 'any', enabled: true,
+    status: { state: 'throttled', retryAt: past, retryCount: 2 },
+  }];
+  await sched.runRescueTick(async () => ({ httpStatus: 200 })); // 返回没有 .state 的对象
+  const aNoState = store.data.accounts.find((a) => a.id === 'dl-nostate');
+  const raNoState = aNoState.status.retryAt ? Date.parse(aNoState.status.retryAt) : null;
+  const notPastNoState = raNoState === null || raNoState > Date.now();
+  eq('死锁B：探活无 state 结果，跑完一轮后 retryAt 不再是过去', notPastNoState, true);
+  eq('死锁B：needsRecheck 接管（=== true）', as.needsRecheck(aNoState), true);
+
+  // 复位，别带坏后面
+  store.data.accounts = [];
+}
+
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

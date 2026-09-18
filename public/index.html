@@ -307,6 +307,21 @@
               <p class="sh">分钟。临时限流的账号到点后自动探活，好了就恢复可用，不用手动刷新。填 <code>0</code> 关闭。默认 5 分钟。</p>
             </div>
           </div>
+          <div class="setrow">
+            <span class="sk">重试上限</span>
+            <div class="sv">
+              <input type="number" id="set-retrymax" min="0" max="20" step="1" inputmode="numeric">
+              <p class="sh">次。账号被限流（transient 失败）后后台自动探活重试的次数；重试间隔随机 3 秒~3 分钟。填 <code>0</code> 关闭抢救期，退回旧行为（失败即按冷却时长冻结）。默认 5 次。</p>
+            </div>
+          </div>
+          <div class="setrow">
+            <span class="sk">重试用尽冻结</span>
+            <div class="sv">
+              <label class="inline-toggle"><input type="checkbox" class="switch" id="set-freeze"><span>用尽后冻结账号</span></label>
+              <input type="number" id="set-freezemin" min="1" max="1440" step="1" inputmode="numeric">
+              <p class="sh">分。默认关：重试用尽后不冻结，放回常规复检自然恢复。开启后按设定时长冻结。默认 30 分钟。</p>
+            </div>
+          </div>
         </div>
       </div>
 

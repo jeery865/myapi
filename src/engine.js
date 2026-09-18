@@ -43,7 +43,7 @@ import {
 import { usage, usageFromJson, createUsageSniffer } from './usage.js';
 import { appendChat } from './chatlog.js';
 import { readBody, randomId, createRateLimiter, createGate, clientIp } from './util.js';
-import { classifyRateLimit, withRecoverAt, isStatusLive } from './account-status.js';
+import { classifyRateLimit, failureStatus, isStatusLive } from './account-status.js';
 import { enginePausedMessage } from './vendor-patch.js';
 
 // 同时在处理的 /v1 请求数上限：每个请求都可能带几 MB body + 一条上游流
@@ -837,16 +837,18 @@ async function dispatchApi(req, res, url) {
       recordModelResult(roundModel, { ok: false, status: resp.status, text });
       // 匿名那条路不是真账号，别往库里写状态
       if (!acct.anonymous) {
-        // withRecoverAt 会给"会自己好"的状态挂一个到期时间戳。控制台据此显示倒计时，
-        // 选号/健康计数据此在到期后自动放行 —— 这就是"不用手动刷新"的支点。
-        // 终态（token_invalid / banned）不加，免得看起来像会自己恢复。
-        store.setAccountStatus(acct.id, withRecoverAt({
+        // 失败回写：进入/继续「快速抢救期」（见 src/account-status.js 的 failureStatus）。
+        // 上游给了明确时长 hint 就按 hint 写 recoverAt；拿不到 hint 的 transient 失败
+        // 才进随机抢救期。acct.status 作为 prior 传进去，用来判断抢救期是否进行中
+        // （进行中就不重置 retryCount，只把 retryAt 重新随机一次）。
+        // 终态（token_invalid / banned）不加任何 recoverAt，免得看起来像会自己恢复。
+        store.setAccountStatus(acct.id, failureStatus({
           state,
           verdict: FAILURE_TEXT[state] || '上游失败',
           detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
           quota: acct.status?.quota || '',
           source: 'request',
-        }, text, resp.status));
+        }, text, resp.status, acct.status));
       }
       last = { status: resp.status, text, acct, state };
       tried.push(`${acct.id}:${state}`);

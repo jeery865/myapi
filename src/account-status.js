@@ -19,6 +19,26 @@ import { store } from './store.js';
 export const EXHAUSTED_THRESHOLD_MS = 15 * 60 * 1000;
 
 /**
+ * 「快速抢救期」随机重试窗口的下限 / 上限（毫秒）。
+ * 3 秒 ~ 3 分钟，**每次失败重新均匀随机**一个值（不是给账号定一个固定值）。
+ * 两个端点写成具名常量放在一处：下游（失败回写 / 后台探活推进）只读这两个，别散落魔数。
+ * 窗口**不做成可配置** —— 用户只要求"重试上限"可调，把范围收敛住，
+ * 避免有人把下限调成 0 或上限调成几小时把抢救期拖没意义。
+ */
+export const RESCUE_DELAY_MIN_MS = 3 * 1000;
+export const RESCUE_DELAY_MAX_MS = 180 * 1000;
+
+/**
+ * 均匀随机一个抢救期重试间隔（毫秒）。
+ * rng 默认 Math.random；测试可注入确定性随机源（见 tests/unit.mjs），
+ * 这样既能断言区间、又能断言"多次调用结果不同"而绝不 flaky。
+ */
+export function randomRescueDelay(rng = Math.random) {
+  const r = Math.min(0.999999, Math.max(0, rng()));
+  return Math.round(RESCUE_DELAY_MIN_MS + r * (RESCUE_DELAY_MAX_MS - RESCUE_DELAY_MIN_MS));
+}
+
+/**
  * 从 429 正文里挖出上游建议的等待时长。
  * 两种已知格式：
  *   {"retryAfterMs": 15506639}        —— luna 等模型
@@ -86,6 +106,83 @@ export function withRecoverAt(status, text, httpStatus) {
 }
 
 /**
+ * 真实请求撞到 transient 失败时调用：决定进入「快速抢救期」还是按上游提示冷却/冻结。
+ * `prior` 是该账号当前已存的状态（用它的 retryAt / retryCount 判断抢救期是否进行中）。
+ *
+ * 三条路（详见交付设计）：
+ *   - 终态（token_invalid / banned ……）：不写 recoverAt，和旧行为一致；
+ *   - transient **且**上游给了明确时长 hint（parseRetryAfterMs 非 null，含"当日额度用完"的
+ *     15 分钟分支）：尊重上游，直接按 hint 写 recoverAt（沿用 clamp [5s, 6h]），不走随机抢救；
+ *   - transient 且拿不到 hint：进入 / 继续「快速抢救期」——
+ *       没有进行中的抢救期 → retryCount=1 开一个新的；
+ *       已有进行中（prior.retryAt 还在未来）→ 不重置 retryCount，只把 retryAt 重新随机一次
+ *       （避免后台主动探活和真实流量撞在一起把计数搅乱）。
+ * accountRetryMax <= 0 视为「关闭抢救期」：退回旧行为（withRecoverAt，按 cooldownFor 写 recoverAt）。
+ */
+export function failureStatus(status, text, httpStatus, prior = null) {
+  if (!TRANSIENT_STATES.has(status.state)) return status; // 终态：不写 recoverAt
+  const max = Number(store.settings?.accountRetryMax);
+  if (!Number.isFinite(max) || max <= 0) return withRecoverAt(status, text, httpStatus); // 抢救期关闭 → 旧行为
+  const hint = parseRetryAfterMs(text, httpStatus);
+  if (hint !== null) {
+    const ms = Math.min(Math.max(hint, 5 * 1000), 6 * 3600 * 1000);
+    return { ...status, recoverAt: new Date(Date.now() + ms).toISOString(), cooldownMs: ms };
+  }
+  const now = Date.now();
+  const inRescue = Boolean(prior && prior.retryAt && Date.parse(prior.retryAt) > now);
+  const retryCount = inRescue ? Number(prior.retryCount || 0) : 1;
+  return { ...status, retryCount, retryAt: new Date(now + randomRescueDelay()).toISOString() };
+}
+
+/**
+ * 后台 3 秒 tick 探活回来后，根据探活结果推进「快速抢救期」。纯函数：给旧状态 +
+ * 本次探活结果 + 设置，算出新状态，不碰网络/落盘（落盘交给调用方）。
+ *
+ *   - 探活成功 → 清掉 retryCount / retryAt，抢救期结束；
+ *   - 探活拿到上游 hint（或终态）→ 尊重上游：hint 写 recoverAt（clamp [5s,6h]）、
+ *     终态直接落定，两者都结束抢救；
+ *   - transient 且无 hint 失败 → retryCount++：
+ *       还 <= 上限 → 继续（再 random 一个 retryAt）；
+ *       超过上限 → 抢救期结束：accountFreezeEnabled 开 → 按 accountFreezeMinutes 写
+ *       recoverAt 冻结（带 frozen 标记）；关（默认）→ 状态保持原样、清掉 retryAt/retryCount，
+ *       交回 5 分钟常规复检（needsRecheck 因此恢复为 true）。
+ */
+export function advanceRescue(prior, probe, settings) {
+  const now = Date.now();
+  // probe 在 raw 模式下可能带 rawText（上游原文，可能含账号信息）。它只用于在本函数里
+  // parse 一次上游 retry 提示，绝不能经 {...probe} 展开写进 store，所以先把字段剥离，
+  // 后续所有 {...p, ...} 都用剥离后的版本（rawText 不会出现在返回值里）。
+  const { rawText: _rawText, ...p } = probe;
+  if (p.state === 'ok') {
+    return { ...p, retryCount: 0, retryAt: null, source: 'rescue' };
+  }
+  // 关键：hint 只从上游原文（rawText）里挖，绝不用 p.detail —— 那是我们自己写的
+  // 格式化文案（如"当天 session 额度已用完"含"当天"，会误触发 15 分钟分支），拿它当
+  // 证据等于凭空造 hint，违反设计 C。rawText 为空 = "没证据" → 继续随机重试。
+  const hint = parseRetryAfterMs(_rawText || '', p.httpStatus);
+  if (hint !== null) {
+    const ms = Math.min(Math.max(hint, 5 * 1000), 6 * 3600 * 1000);
+    return { ...p, recoverAt: new Date(now + ms).toISOString(), cooldownMs: ms, retryCount: 0, retryAt: null, source: 'rescue' };
+  }
+  if (!TRANSIENT_STATES.has(p.state)) {
+    // 终态（token_invalid / banned …）：直接落定，结束抢救，不进随机重试
+    return { ...p, retryCount: 0, retryAt: null, source: 'rescue' };
+  }
+  const max = Number(settings?.accountRetryMax) || 0;
+  const rc = Number(prior?.retryCount || 0) + 1;
+  if (rc > max) {
+    if (settings?.accountFreezeEnabled) {
+      const mins = Math.max(1, Math.min(1440, Number(settings.accountFreezeMinutes) || 30));
+      const ms = mins * 60 * 1000;
+      return { ...p, recoverAt: new Date(now + ms).toISOString(), cooldownMs: ms, frozen: true, retryCount: 0, retryAt: null, source: 'rescue' };
+    }
+    // 默认不冻结：状态保持原样，交回常规复检
+    return { ...p, retryCount: 0, retryAt: null, source: 'rescue' };
+  }
+  return { ...p, retryCount: rc, retryAt: new Date(now + randomRescueDelay()).toISOString(), source: 'rescue' };
+}
+
+/**
  * 这个状态现在还"算数"吗？
  * 带 recoverAt 且已过期的 → 不算数了，等价于没标记。**这就是"不用手动刷新"的实现**：
  * 选号、控制台灯泡、健康计数都走这个函数，时间一到账号自己就绿了。
@@ -112,6 +209,16 @@ export function needsRecheck(account, now = Date.now()) {
   const st = account && account.status;
   if (!st || !st.state || st.state === 'ok') return false;
   if (!TRANSIENT_STATES.has(st.state)) return false;
+  // 正在「快速抢救期」的账号由专门的 3 秒 tick 负责探活，别让 5 分钟常规复检也来捞它
+  // —— 否则会出现两套机制同时探同一个号、白白多打上游。抢救期结束（成功 / 超限交回 /
+  // 封冻结）时 retryAt 会被清掉，那时 needsRecheck 自然恢复为 true，重新回到常规复检手里。
+  // 兜底：retryAt 若因任何原因停留在过去（理论不该发生 —— runRescueTick 的死锁不变量
+  // 保证它要么在未来、要么为 null），这里也当「抢救已结束」放行，避免账号永久卡死。
+  if (st.retryAt) {
+    const ra = Date.parse(st.retryAt);
+    if (!Number.isFinite(ra) || ra > now) return false; // 真在抢救中（retryAt 在未来）→ 排除
+    // 落在过去：当抢救已结束，放行给常规复检
+  }
   if (!st.recoverAt) return true;
   const at = Date.parse(st.recoverAt);
   if (!Number.isFinite(at)) return true;

@@ -19,7 +19,9 @@ import { store, providerOf } from './store.js';
 import { probeAccount } from './probe.js';
 import { probeOpencodeKey } from './opencode.js';
 import { refreshCatalog } from './models.js';
-import { needsRecheck, recheckIntervalMs } from './account-status.js';
+import { needsRecheck, recheckIntervalMs, advanceRescue } from './account-status.js';
+import { getUpstream } from './upstreams.js';
+import { probeUpstreamKey } from './protocols/index.js';
 
 const TICK_MS = 60 * 1000;
 // 模型表自己按 REFRESH_MS（6 小时）节流，这边只要保证"总有人定期叫它"。
@@ -91,6 +93,88 @@ export async function runSchedulerTick() {
   } finally {
     busy = false;
   }
+}
+
+// ───────────────────────────── 快速抢救期（独立细粒度 tick）
+// 60 秒那个 tick 撑不住「3 秒~3 分钟」的精度（3~60 秒那段会被量化成"下一分钟"），
+// 所以这里单独起一个 3 秒的 tick 专扫 retryAt <= now 的账号。它**只**管抢救期账号，
+// 不动 60 秒 tick 的语义（它的文档注释解释了为什么用统一 tick，别推翻）。
+// 探活串行（同 recheck）：并发会被上游按出口 IP 记一笔；用 busy 防重入。
+const RESCUE_TICK_MS = 3 * 1000;
+let rescueTimer = null;
+let rescueBusy = false;
+
+/** 按 provider 选探活方式。freebuff 走 raw（不带 recoverAt），否则抢救期会误判 hint。 */
+async function probeAccountForRescue(acct) {
+  const prov = providerOf(acct);
+  if (prov === 'opencode') return probeOpencodeKey(acct.token);
+  if (prov === 'freebuff') return probeAccount(acct.token, { raw: true });
+  const up = getUpstream(prov);
+  if (up) return probeUpstreamKey(up, acct.token);
+  return null;
+}
+
+/**
+ * 探一次活，用 advanceRescue 把结果折算成新状态落盘。每次只动一个号、串行。
+ *
+ * 死锁不变量（防 QA 证实的卡死 bug）：本函数处理完任意一个号后，它的 retryAt
+ * 必须「要么被推进到未来、要么被清成 null」——绝不允许停留在过去。一旦停留在过去，
+ * needsRecheck 会因为 retryAt 仍在而永远返回 false（常规复检永不接管），
+ * runRescueTick 又因为 retryAt <= now 每个 tick 都捞它却原地不动，账号永久卡在
+ * 「抢救中」。下面两个出口都遵守这条：探活有结论 → advanceRescue 要么给未来 retryAt
+ * 要么清 null；探活拿不到结论（provider 未注册 / 探活能力缺失，result 为 null 或没有
+ * state）→ 视为「这个号根本没法探活」，立即结束抢救期交回常规复检（不写 recoverAt、
+ * 不冻结：我们并不知道它坏没坏，凭空冻结是设计里否决过的行为）。
+ */
+async function probeAndAdvanceRescue(acct, settings, probeFn = probeAccountForRescue) {
+  const result = await probeFn(acct);
+  if (!result || !result.state) {
+    // 探活拿不到结论：不是「账号坏」，而是「这个号没法探活」。继续随机重试对它毫无意义，
+    // 直接结束抢救期、交回常规复检（清 retryAt/retryCount），至少不会让它永远卡住。
+    // 注意：不写 recoverAt、不冻结 —— 凭空冻结是设计里否决过的行为。
+    store.setAccountStatus(acct.id, { ...acct.status, retryCount: 0, retryAt: null, source: 'rescue-no-probe' });
+    return;
+  }
+  store.setAccountStatus(acct.id, advanceRescue(acct.status, result, settings));
+}
+
+/**
+ * 跑一轮抢救期扫描。测试可直接调它，不用等定时器。
+ * probeFn 仅测试用：注入「无结论」结果以复现 / 覆盖 null 与无 state 两种分支。
+ */
+export async function runRescueTick(probeFn = probeAccountForRescue) {
+  if (rescueBusy) return; // 上一轮还没跑完，别叠起来
+  rescueBusy = true;
+  try {
+    const now = Date.now();
+    const settings = store.settings;
+    const due = store.accounts.filter(
+      (a) => a.enabled !== false && a.token && a.token.length > 8 && a.status?.retryAt && Date.parse(a.status.retryAt) <= now
+    );
+    for (const acct of due) {
+      try {
+        await probeAndAdvanceRescue(acct, settings, probeFn);
+      } catch {
+        /* 单个号探活失败不影响其它号，下一轮还会再轮到它 */
+      }
+    }
+  } finally {
+    rescueBusy = false;
+  }
+}
+
+export function startRescueScheduler() {
+  if (rescueTimer) return;
+  rescueTimer = setInterval(() => {
+    runRescueTick().catch(() => {});
+  }, RESCUE_TICK_MS);
+  if (typeof rescueTimer.unref === 'function') rescueTimer.unref();
+  console.log('[scheduler] 已启动：快速抢救期 3 秒一跳，扫描到点的重试账号');
+}
+
+export function stopRescueScheduler() {
+  if (rescueTimer) clearInterval(rescueTimer);
+  rescueTimer = null;
 }
 
 export function startScheduler() {

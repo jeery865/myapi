@@ -1071,6 +1071,20 @@ function renderAccounts(s) {
           tagClass = 'ok';
           label = st.verdict;
           tip = st.detail || '';
+        } else if (st.retryAt) {
+          // 快速抢救期：后台正在主动重试，还没放弃这个号（见 src/account-status.js 的 failureStatus / advanceRescue）
+          const max = Number(STATE.settings?.accountRetryMax) || 0;
+          const left = Math.max(0, max - (Number(st.retryCount) || 0) + 1);
+          tagClass = 'warn';
+          label = `抢救中（还剩 ${left} 次）`;
+          tip = `${st.detail || ''}\n后台正在自动重试，不用手动刷新`;
+        } else if (st.frozen) {
+          // 用户开了冻结且已冻结：直接给到期时间（见 advanceRescue 的冻结分支）
+          const at = Date.parse(st.recoverAt);
+          const hhmm = Number.isFinite(at) ? new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '';
+          tagClass = 'bad';
+          label = hhmm ? `已冻结（到 ${hhmm}）` : '已冻结';
+          tip = `${st.detail || ''}\n重试用尽已按设置冻结，到时间后自动恢复`;
         } else if (statusLive(st)) {
           const wait = recoverIn(st);
           tagClass = LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn';
@@ -1403,6 +1417,12 @@ function renderSettings(s) {
     fb === 'off' ? '关闭' : fb === 'tier' ? '同档位内接管' : '可跨档位接管';
   const recheck = Number(s.settings.accountRecheckMinutes);
   $('#set-recheck').value = Number.isFinite(recheck) ? recheck : 5;
+  // 快速抢救期设置：重试上限 / 重试用尽是否冻结 / 冻结时长
+  const retryMax = Number(s.settings.accountRetryMax);
+  $('#set-retrymax').value = Number.isFinite(retryMax) ? retryMax : 5;
+  $('#set-freeze').checked = Boolean(s.settings.accountFreezeEnabled);
+  const freezeMin = Number(s.settings.accountFreezeMinutes);
+  $('#set-freezemin').value = Number.isFinite(freezeMin) ? freezeMin : 30;
   // 目录和持久性挤在一行：持久性是这个目录的属性，分成两行反而要来回看
   $('#s-datadir').textContent = `${s.storage.dir}　${s.storage.persistent ? '持久' : '临时 · 重新部署会清空'}`;
   $('#s-persist-note').textContent = s.storage.volume
@@ -1580,6 +1600,38 @@ $('#set-recheck').addEventListener('change', async (ev) => {
   try {
     await api('/settings', { method: 'PATCH', body: { accountRecheckMinutes: n } });
     toast(n === 0 ? '已关闭后台复检' : `已保存 —— 每 ${n} 分钟复检一次限流账号`);
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+$('#set-retrymax').addEventListener('change', async (ev) => {
+  const n = Math.max(0, Math.min(20, Math.round(Number(ev.target.value) || 0)));
+  ev.target.value = n;
+  try {
+    await api('/settings', { method: 'PATCH', body: { accountRetryMax: n } });
+    toast(n === 0 ? '已关闭快速抢救期（退回旧行为）' : `已保存 —— 重试用尽上限 ${n} 次`);
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+$('#set-freeze').addEventListener('change', async (ev) => {
+  const on = ev.target.checked;
+  try {
+    await api('/settings', { method: 'PATCH', body: { accountFreezeEnabled: on } });
+    toast(on ? '已开启：重试用尽后冻结账号' : '已关闭：重试用尽后放回常规复检');
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+$('#set-freezemin').addEventListener('change', async (ev) => {
+  const n = Math.max(1, Math.min(1440, Math.round(Number(ev.target.value) || 1)));
+  ev.target.value = n;
+  try {
+    await api('/settings', { method: 'PATCH', body: { accountFreezeMinutes: n } });
+    toast(`已保存 —— 冻结时长 ${n} 分钟`);
   } catch (err) {
     toast(err.message, 'err');
     sync(true);

@@ -80,6 +80,13 @@ function emptyData() {
       // 后台复检间隔（分钟）。0 = 关闭。
       // 到期状态（recoverAt 已过）由它来清理，这样"撞一次限流就得手动刷新"就没了。
       accountRecheckMinutes: 5,
+      // 快速抢救期：transient 失败不是直接冻 30 分钟，而是后台主动探活重试。
+      //   accountRetryMax   主动重试上限（次）；0 = 关闭抢救期，退回旧行为（按 cooldownFor 写 recoverAt）
+      //   accountFreezeEnabled  重试用尽后是否冻结账号；默认 false（不冻结，放回常规复检）
+      //   accountFreezeMinutes  冻结时长（分钟），仅 accountFreezeEnabled=true 时生效
+      accountRetryMax: 5,
+      accountFreezeEnabled: false,
+      accountFreezeMinutes: 30,
     },
     // 模型实测状态：id -> { state, at, detail, fails }
     modelStatus: {},
@@ -511,6 +518,34 @@ class Store {
       const n = Number(patch.accountRecheckMinutes);
       // 0 是合法值（= 关闭）。上限一天，避免手滑写个 100000 把定时器变成几乎不跑
       if (Number.isFinite(n) && n >= 0 && n <= 1440) s.accountRecheckMinutes = Math.floor(n);
+    }
+    if ('accountRetryMax' in patch) {
+      // 只接受 number 或数字字符串；其余（null / 布尔 / 数组 / 对象 / "abc"）一律拒收并
+      // 保留原值。宽松的 Number() 会把 null → 0（= 悄悄关闭抢救期）、true → 1、[] → 0，
+      // 这种「手滑把功能关掉」的静默行为比显式报错更危险，所以收紧。
+      const raw = patch.accountRetryMax;
+      let n = NaN;
+      if (typeof raw === 'number' && Number.isFinite(raw)) n = raw;
+      else if (typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw))) n = Number(raw);
+      if (Number.isFinite(n) && n >= 0 && n <= 20) s.accountRetryMax = Math.floor(n);
+    }
+    if ('accountFreezeEnabled' in patch) {
+      // 接受真布尔值；字符串则显式解析（"false"→false，其余非空→true，如 'yes'→true，
+      // 与既有行为一致），绝不让 Boolean("false") 把"关"误判成"开"。数字 / 对象 / 数组 /
+      // null 一律保留原值，不隐式转换。
+      const raw = patch.accountFreezeEnabled;
+      if (typeof raw === 'boolean') s.accountFreezeEnabled = raw;
+      else if (typeof raw === 'string') s.accountFreezeEnabled = raw.trim().toLowerCase() !== 'false';
+    }
+    if ('accountFreezeMinutes' in patch) {
+      // 同 accountRetryMax：只接受 number 或数字字符串，其余（null / 布尔 / 数组 / 对象）
+      // 拒收并保留原值。
+      const raw = patch.accountFreezeMinutes;
+      let n = NaN;
+      if (typeof raw === 'number' && Number.isFinite(raw)) n = raw;
+      else if (typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw))) n = Number(raw);
+      // 至少 1 分钟、最多一天。仅在 accountFreezeEnabled=true 时生效
+      if (Number.isFinite(n) && n >= 1 && n <= 1440) s.accountFreezeMinutes = Math.floor(n);
     }
     if ('activeAccountId' in patch) {
       const id = patch.activeAccountId ? String(patch.activeAccountId) : null;
