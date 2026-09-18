@@ -1,6 +1,11 @@
 // 临时测试：这轮安全加固的单元级验证
 process.env.DATA_DIR = './data-test-unit';
 process.env.ADMIN_PASSWORD = 'unit-test-pw';
+// 每次从干净目录开始。store 会把设置落盘，而**单独**跑这个文件（不走 tests/run.mjs）时
+// 没人清理它 —— 上一轮留下的值会被当成"默认值"读进来，断言就随运行历史飘
+// （曾经实测到：连跑三次得到三个不同结果）。tests/run.mjs 本来就是跑前后各删一次，
+// 这里补上同一件事，让裸跑也一致。
+(await import('node:fs')).rmSync('./data-test-unit', { recursive: true, force: true });
 const { clientIp, publicBaseUrl, constantTimeEqual } = await import('../src/util.js');
 const { safeTarget } = await import('../src/browser.js');
 const { store } = await import('../src/store.js');
@@ -1245,6 +1250,384 @@ store.updateSettings({ accountFreezeMinutes: 30 });
   eq('cline 号不进常规复检队列（返 0）', await sched.recheckAccounts(), 0);
   st.data.accounts = [];
   st.saveNow();
+}
+
+// ── 出口代理（Clash 订阅 → mihomo → 出站走节点）───────────────────────────
+{
+  const proxy = await import('../src/proxy.js');
+
+  // 默认值必须是最保守的一档：关着、失败就阻断（不回退直连）
+  eq('代理开关默认关', store.settings.proxyEnabled, false);
+  eq('代理失败默认阻断（不回退直连）', store.settings.proxyBlockOnFailure, true);
+  eq('订阅地址默认为空', store.settings.proxySubscriptionUrl, '');
+  eq('选中节点默认为空（= 自动）', store.settings.proxySelectedNode, '');
+
+  // 两个布尔开关：字符串 "false" 必须解析成 false —— Boolean("false") 是 true，
+  // 那会让"关"变成"开"，在这个功能里等于把真实 IP 暴露出去
+  store.updateSettings({ proxyEnabled: true });
+  eq('proxyEnabled=true 能开', store.settings.proxyEnabled, true);
+  store.updateSettings({ proxyEnabled: 'false' });
+  eq('字符串 "false" 解析成 false（不是 true）', store.settings.proxyEnabled, false);
+  store.updateSettings({ proxyEnabled: null });
+  eq('null 不被接受（保留原值）', store.settings.proxyEnabled, false);
+  store.updateSettings({ proxyBlockOnFailure: 'false' });
+  eq('proxyBlockOnFailure "false" → false', store.settings.proxyBlockOnFailure, false);
+  store.updateSettings({ proxyBlockOnFailure: true });
+
+  // 订阅地址是服务端主动去 GET 的地址 → 必须拦住 SSRF 面；且明文 http 会泄露凭据
+  for (const [name, bad] of [
+    ['http 明文被拒', 'http://example.com/sub'],
+    ['file:// 被拒', 'file:///etc/passwd'],
+    ['回环被拒', 'https://127.0.0.1/sub'],
+    ['localhost 被拒', 'https://localhost/sub'],
+    ['内网段被拒', 'https://192.168.1.1/sub'],
+    ['云元数据被拒', 'https://169.254.169.254/latest'],
+    ['超长被拒', 'https://example.com/' + 'a'.repeat(2100)],
+  ]) {
+    store.updateSettings({ proxySubscriptionUrl: bad });
+    eq(name, store.settings.proxySubscriptionUrl, '');
+  }
+  store.updateSettings({ proxySubscriptionUrl: 'https://sub.example.com/clash?token=abc' });
+  eq('https 公网地址被接受', store.settings.proxySubscriptionUrl, 'https://sub.example.com/clash?token=abc');
+  store.updateSettings({ proxySubscriptionUrl: '' });
+  eq('空串 = 清空订阅', store.settings.proxySubscriptionUrl, '');
+
+  store.updateSettings({ proxySelectedNode: '香港-01' });
+  eq('节点名正常写入', store.settings.proxySelectedNode, '香港-01');
+  store.updateSettings({ proxySelectedNode: 'x'.repeat(200) });
+  eq('超长节点名被拒（保留原值）', store.settings.proxySelectedNode, '香港-01');
+  store.updateSettings({ proxySelectedNode: '' });
+
+  // /state 的脱敏：订阅 URL 里常带机场凭据，只能下发 host
+  store.updateSettings({ proxySubscriptionUrl: 'https://sub.example.com/clash?token=SECRETTOKEN' });
+  const pxStatus = proxy.getProxyStatus();
+  eq('状态里只给 host（脱敏）', pxStatus.subscriptionHost, 'sub.example.com');
+  eq('状态里不含 URL 的 path/query', JSON.stringify(pxStatus).includes('SECRETTOKEN'), false);
+  eq('undici 依赖可用（代理功能的前提）', pxStatus.undiciAvailable, true);
+  eq('伪装默认没在跑', pxStatus.enabled, false);
+  store.updateSettings({ proxySubscriptionUrl: '' });
+
+  // mihomo config 的几条硬要求（都是安全项，不能被人"顺手简化"掉）
+  const yaml = proxy.buildConfigYaml();
+  eq('config: allow-lan 必须 false（否则变成开放代理）', /^allow-lan: false$/m.test(yaml), true);
+  eq('config: 只绑回环', /^bind-address: 127\.0\.0\.1$/m.test(yaml), true);
+  eq('config: 控制 API 只在回环', /^external-controller: 127\.0\.0\.1:\d+$/m.test(yaml), true);
+  eq('config: secret 非空', /^secret: \S{16,}$/m.test(yaml), true);
+  eq('config: ipv6 关闭（否则 AAAA 会绕过代理漏真实出口）', /^ipv6: false$/m.test(yaml), true);
+  eq('config: 订阅路径指向数据目录', yaml.includes('data-test-unit/clash/sub.yaml'), true);
+
+  // 请求前的那道闸
+  store.updateSettings({ proxyEnabled: false });
+  eq('关着时闸放行', await proxy.proxyBlocksRequest(), null);
+  store.updateSettings({ proxyEnabled: true });
+  const blocked = await proxy.proxyBlocksRequest();
+  eq('开着但内核没跑 → 拦住并给出原因', typeof blocked === 'string' && blocked.length > 0, true);
+  store.updateSettings({ proxyBlockOnFailure: false });
+  eq('用户允许回退直连时不拦', await proxy.proxyBlocksRequest(), null);
+  store.updateSettings({ proxyEnabled: false, proxyBlockOnFailure: true });
+
+  // ★ 回归守护：显式传 dispatcher 的请求必须走 undici 自己的 fetch。
+  //   改成内置 fetch 会立刻 UND_ERR_INVALID_ARG 失败（实测），所以这条一红就是有人改回去了。
+  const httpMod = await import('node:http');
+  const srv = httpMod.createServer((_, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    let pxStatus2 = null;
+    let pxText = null;
+    try {
+      const resp = await proxy.fetchWithTimeout(`http://127.0.0.1:${srv.address().port}/x`);
+      pxStatus2 = resp.status;
+      pxText = await resp.text();
+    } catch (err) {
+      // 改回内置 fetch 时这里会抛 UND_ERR_INVALID_ARG —— 打印出来便于定位
+      console.log(`   （请求抛错：${err.message}${err.cause ? ' / ' + (err.cause.code || err.cause.message) : ''}）`);
+    }
+    eq('显式 dispatcher 的请求能打通（防 UND_ERR_INVALID_ARG 回归）', pxStatus2, 200);
+    eq('返回体正确', pxText, 'ok');
+  } finally {
+    srv.close();
+  }
+  // ★ 回归守护：超时必须用 AbortController + clearTimeout，不能用 AbortSignal.timeout ——
+  //   后者在请求早已结束后仍会触发 abort，撞上 undici 内部的断言把进程带崩。
+  const proxySrc = await (await import('node:fs/promises')).readFile(new URL('../src/proxy.js', import.meta.url), 'utf8');
+  // 先去掉注释再查：注释里刻意写了 "不要用 AbortSignal.timeout" 的说明，那不算违规
+  const codeOnly = proxySrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((l) => !l.trim().startsWith('//'))
+    .join('\n');
+  eq('proxy.js 里没有 AbortSignal.timeout 调用（进程崩溃源）', /AbortSignal\.timeout/.test(codeOnly), false);
+
+  // ★ 并发启动内核必须共享同一次启动。
+  //   老写法是 `if (kernelRunning() || starting) return kernelRunning()` —— 后到的调用者
+  //   在内核还没就绪时直接拿到 false，而 lastError 已被第一个调用者清空，于是返回
+  //   `{running:false, error:''}`：控制台显示"内核没跑"却给不出原因（实测 4 次并发里 3 次如此）。
+  //   现在 startKernel 是薄包装，把同一次启动的 promise 发给所有调用者。
+  eq('startKernel 是共享 promise 的薄包装', /startPromise\s*=\s*startKernelInner\(\)/.test(codeOnly), true);
+  eq('启动实现拆在 startKernelInner 里', /async function startKernelInner\s*\(/.test(codeOnly), true);
+  eq('没有「启动中就直接回 false」的早退', /kernelRunning\(\)\s*\|\|\s*starting/.test(codeOnly), false);
+  {
+    // 离线下的行为一致性：二进制不存在时多次并发调用应当拿到同一个结论，且不抛
+    const conc = await Promise.all([proxy.startKernel(), proxy.startKernel(), proxy.startKernel()]);
+    eq('并发 startKernel 结论一致', conc.every((x) => x === conc[0]), true);
+    eq('（前提）没有内核二进制时结论是 false', conc[0], false);
+  }
+
+  // ★ SSRF：内网判定必须覆盖 IPv6 和各种 IP 写法。
+  //   老版本是一串点分十进制的正则，实测会放过 [::ffff:127.0.0.1]（URL 规范化后是 ::ffff:7f00:1）
+  //   以及整段 IPv6 私有地址（fc00::/7、fe80::/10）—— 这两处是真实的绕过口子。
+  const { isPrivateIp, isPublicHttpUrl } = await import('../src/util.js');
+  for (const [ip, want] of [
+    ['127.0.0.1', true], ['10.1.2.3', true], ['172.16.0.1', true], ['172.31.255.254', true],
+    ['192.168.1.1', true], ['169.254.169.254', true], ['0.0.0.0', true], ['100.64.0.1', true],
+    ['224.0.0.1', true], ['255.255.255.255', true],
+    ['::1', true], ['::', true], ['::ffff:127.0.0.1', true], ['::ffff:7f00:1', true],
+    ['fc00::1', true], ['fd12:3456::1', true], ['fe80::1', true], ['ff02::1', true],
+    ['172.32.0.1', false], ['8.8.8.8', false], ['1.1.1.1', false],
+    ['::ffff:8.8.8.8', false], ['2001:4860:4860::8888', false],
+  ]) {
+    eq(`isPrivateIp(${ip})`, isPrivateIp(ip), want);
+  }
+  for (const [url, want] of [
+    ['https://[::ffff:127.0.0.1]/s', false], ['https://[::ffff:7f00:1]/s', false],
+    ['https://[fc00::1]/s', false], ['https://[fe80::1]/s', false], ['https://[::1]/s', false],
+    ['https://2130706433/s', false], ['https://0x7f000001/s', false], ['https://0177.0.0.1/s', false],
+    ['https://127.0.0.1/s', false], ['https://127.1/s', false], ['https://169.254.169.254/latest/meta-data/', false],
+    ['https://foo.internal/s', false], ['https://foo.local/s', false], ['https://localhost/s', false],
+    ['https://0.0.0.0/s', false], ['https://172.16.0.1/s', false], ['https://172.31.255.1/s', false],
+    ['https://metadata.google.internal/s', false],
+    // ★ 尾点（root-anchored FQDN）：`endsWith('.internal')` 判不到 `foo.internal.`，
+    //   实测这里漏过 —— 后缀黑名单必须先去尾点，否则一行就能绕过。
+    ['https://metadata.google.internal./s', false], ['https://localhost./s', false],
+    ['https://foo.internal./s', false], ['https://foo.local./s', false],
+    ['file:///etc/passwd', false], ['gopher://example.com/', false], ['', false],
+    ['http://example.com/s', false],
+    ['https://example.com/s', true], ['https://1.1.1.1/s', true],
+    ['https://[2001:4860:4860::8888]/s', true],
+  ]) {
+    eq(`isPublicHttpUrl(${url})`, isPublicHttpUrl(url, { requireHttps: true }), want);
+  }
+
+  // ★ SSRF：订阅的重定向必须自己跟、每一跳都过闸。
+  //   用 redirect:'follow' 时实测一个 302 到 http://169.254.169.254/ 会被**真的跟过去**，
+  //   于是「订阅地址必须是 https 公网」这道闸被一次重定向就绕开了。
+  eq("proxy.js 代码里没有 redirect:'follow'", /redirect\s*:\s*['"]follow['"]/.test(codeOnly), false);
+  eq("proxy.js 代码里有 redirect:'manual'", /redirect\s*:\s*['"]manual['"]/.test(codeOnly), true);
+  {
+    const loop = proxySrc.slice(proxySrc.indexOf('export async function fetchSubscription'));
+    const body = loop.slice(0, loop.indexOf('if (!resp.ok)'));
+    eq('循环体里每一跳都过 assertPublicTarget', /await assertPublicTarget\(current\)/.test(body), true);
+    eq('闸在发请求之前', body.indexOf('await assertPublicTarget(current)') < body.indexOf('await fetchWithTimeout('), true);
+  }
+  // 拿一个真的 302 走一遍：manual 不跟随、Location 可读、且那个目标会被闸拦下
+  {
+    let redirectStatus = null;
+    let redirectLoc = null;
+    const srv2 = httpMod.createServer((_, res) => {
+      res.writeHead(302, { location: 'http://169.254.169.254/latest/meta-data/' });
+      res.end();
+    });
+    await new Promise((r) => srv2.listen(0, '127.0.0.1', r));
+    try {
+      const resp = await proxy.fetchWithTimeout(`http://127.0.0.1:${srv2.address().port}/sub`, {
+        redirect: 'manual',
+        timeoutMs: 5000,
+      });
+      redirectStatus = resp.status;
+      redirectLoc = resp.headers.get('location');
+      if (resp.body) await resp.body.cancel().catch(() => {});
+    } finally {
+      srv2.close();
+    }
+    eq('redirect:manual 返回 302 而不跟随', redirectStatus, 302);
+    eq('Location 头可读', redirectLoc, 'http://169.254.169.254/latest/meta-data/');
+    let blockedTarget = false;
+    try {
+      await proxy.assertPublicTarget(redirectLoc);
+    } catch {
+      blockedTarget = true;
+    }
+    eq('重定向目标（内网）被闸拦下', blockedTarget, true);
+  }
+
+  // ★ 后台探活也必须过闸：代理是所有账号共用的出口，它坏了不该由号来背。
+  //   不加闸的后果：常规复检把整池刷成 network_error；抢救期更糟 —— 会把探活失败
+  //   当成「重试失败」一路推到超限，然后按设置把**整池冻结**。用户只是节点掉线。
+  {
+    const sched = await import('../src/scheduler.js');
+    const { checkAccount } = await import('../src/admin.js');
+    const savedAccounts = store.data.accounts;
+
+    try {
+      store.updateSettings({
+        proxyEnabled: true,
+        proxyBlockOnFailure: true,
+        accountRetryMax: 5,
+        accountFreezeEnabled: true,
+        accountFreezeMinutes: 30,
+      });
+      eq('（前提）代理开着但内核没跑 → 闸拦住了', typeof (await proxy.proxyBlocksRequest()), 'string');
+
+      const rescueStatus = {
+        state: 'throttled',
+        retryCount: 1,
+        retryAt: new Date(Date.now() - 60_000).toISOString(),
+      };
+      store.data.accounts = [
+        { id: 'gate-probe', token: 'fake-token-aaaaaaaa', provider: 'freebuff', pool: 'any', enabled: true, status: { ...rescueStatus } },
+      ];
+      const snapshot = JSON.stringify(store.data.accounts[0].status);
+
+      await sched.runRescueTick();
+      eq('出口不可用时抢救期不推进 retryCount', store.data.accounts[0].status.retryCount, 1);
+      eq('出口不可用时 retryAt 原地不动', store.data.accounts[0].status.retryAt, rescueStatus.retryAt);
+      eq('出口不可用时绝不被凭空冻结', store.data.accounts[0].status.recoverAt, undefined);
+      eq('出口不可用时常规复检整轮跳过', await sched.recheckAccounts(20), 0);
+      eq('常规复检也没改状态', JSON.stringify(store.data.accounts[0].status), snapshot);
+
+      const probeResult = await checkAccount(store.data.accounts[0]);
+      eq('手动探活返回 noProbe（不落库）', probeResult.noProbe, true);
+      eq('手动探活的结论指向出口问题', probeResult.verdict, '出口代理不可用');
+      eq('手动探活也没改状态', JSON.stringify(store.data.accounts[0].status), snapshot);
+
+      // 对照：闸一放开，同一账号立刻被推进 —— 证明上面那几条"不动"确实来自这道闸。
+      // 这里用注入的 probeFn，避免这条断言真的外呼上游（单测要能离线跑）。
+      store.updateSettings({ proxyEnabled: false });
+      await sched.runRescueTick(async () => ({ state: 'throttled', httpStatus: 429, detail: '注入的探活结果' }));
+      const moved =
+        store.data.accounts[0].status.retryCount !== rescueStatus.retryCount ||
+        store.data.accounts[0].status.source === 'rescue-no-probe' ||
+        store.data.accounts[0].status.recoverAt !== undefined;
+      eq('（对照）关掉伪装后抢救期立刻推进', moved, true);
+    } finally {
+      store.data.accounts = savedAccounts;
+      // 显式复位到**已知值**，不要从"块开始时的快照"恢复：那个快照本身可能是
+      // 上一轮留在磁盘上的脏值，恢复等于把脏值又写回去（踩过）。
+      store.updateSettings({
+        proxyEnabled: false,
+        proxyBlockOnFailure: true,
+        accountRetryMax: 5,
+        accountFreezeEnabled: false,
+        accountFreezeMinutes: 30,
+        proxySubscriptionUrl: '',
+      });
+    }
+  }
+
+  // ★ 残留内核占住混合端口时，必须报出明确原因。
+  //   不加这条检查的后果（实退过一次验证）：新内核绑不上 mixed-port，但 waitReady 是拿
+  //   **同一份 secret**（同一个 DATA_DIR 生成的那份）去问那个旧实例 —— 鉴权能过、返回 200，
+  //   于是判定「启动成功」。控制台显示"运行中"、节点列表却是旧的、请求还被 503 拦住，
+  //   三个现象互相矛盾。所以这里必须给一句看得懂的话。
+  {
+    const { createServer } = await import('node:net');
+    const { mkdirSync, writeFileSync, unlinkSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const { config } = await import('../src/config.js');
+
+    // mihomoBin 指向一个**存在但不是可执行文件**的路径：检查在位时根本走不到 spawn；
+    // 万一后人把这处检查删了，spawn 也只会立刻失败，不会在测试机上留下真内核进程。
+    const savedBin = config.mihomoBin;
+    const savedMixed = config.clashMixedPort;
+    const savedApi = config.clashApiPort;
+    const subFile = resolve(config.clashDir, 'sub.yaml');
+    const squatter = createServer(() => {});
+
+    try {
+      mkdirSync(config.clashDir, { recursive: true });
+      // startKernel 的前置条件之一：订阅文件已存在
+      writeFileSync(subFile, 'proxies: []\n', { mode: 0o600 });
+      config.mihomoBin = resolve('package.json');
+      config.clashMixedPort = 17996;
+      config.clashApiPort = 17896;
+      await new Promise((r) => squatter.listen(17996, '127.0.0.1', r));
+
+      const ok = await proxy.startKernel();
+      eq('端口被占时启动失败', ok, false);
+      const err = proxy.getProxyStatus().lastError || '';
+      eq('错误点名端口已被占用', /已被占用/.test(err), true);
+      eq('错误带上了端口号', /17996/.test(err), true);
+      eq('不再误报「启动超时」（那是旧 bug 的形态）', /启动超时/.test(err), false);
+      eq('没把内核标记成运行中', proxy.getProxyStatus().running, false);
+    } finally {
+      await new Promise((r) => squatter.close(r));
+      config.mihomoBin = savedBin;
+      config.clashMixedPort = savedMixed;
+      config.clashApiPort = savedApi;
+      try {
+        unlinkSync(subFile);
+      } catch {
+        /* 本来就不存在 */
+      }
+    }
+  }
+
+  // ★ 内核没跑时，用户点「刷新节点 / 切节点 / 测延迟」不该看到裸的 `fetch failed`。
+  //   这条路径很常被撞到：伪装开着但订阅还没拉、内核起不来、内核刚崩还没重启完。
+  //   原来的表现是控制台弹 `fetch failed`（ECONNREFUSED 127.0.0.1:9090），
+  //   既不知道发生了什么、也不知道下一步做什么。
+  {
+    const e1 = await proxy.listNodes().catch((e) => e);
+    eq('内核没跑时 listNodes 给明确错误码', e1.statusCode, 503);
+    eq('错误说清了是哪件事', /读取节点列表/.test(e1.message), true);
+    eq('提示了下一步（重新加载 / 订阅）', /重新加载/.test(e1.message), true);
+    const e2 = await proxy.selectNode('任意节点').catch((e) => e);
+    eq('selectNode 同样明确', e2.statusCode, 503);
+    const e3 = await proxy.testDelay('任意节点').catch((e) => e);
+    eq('testDelay 同样明确', e3.statusCode, 503);
+    eq('三种错误都不是裸的 fetch failed', [e1, e2, e3].some((e) => /fetch failed/.test(e.message)), false);
+  }
+
+  // ★ 出口指向谁，必须与 proxyBlockOnFailure 的语义严格对应。
+  //
+  //   守的是一个很容易写反的判断（本项目真写反过）：内核起不来 / 没订阅时，
+  //   `block` 的语义是「要不要**保持**指向代理」，所以是 setDispatcher(block)。
+  //   反写成 !block 会让两种设置的行为完全对调 —— 默认（要阻断，宁可不可用也不暴露）
+  //   反而放行直连；而明确选了「回退直连」的人反而死在代理端口上、请求全失败。
+  //   闸还在（所以上游不会被打），但出口指向与设置承诺相反本身就是缺陷。
+  {
+    const { mkdirSync, writeFileSync, unlinkSync, existsSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const { config } = await import('../src/config.js');
+    mkdirSync(config.clashDir, { recursive: true });
+    const subFile = resolve(config.clashDir, 'sub.yaml');
+    writeFileSync(subFile, 'proxies:\n  - {name: A, type: socks5, server: 127.0.0.1, port: 1}\n', { mode: 0o600 });
+
+    // 前提：单测环境里没有 mihomo 二进制（config.mihomoBin = /usr/local/bin/mihomo），
+    // 所以 startKernel 必然失败，正好走「内核起不来」那条分支
+    eq('（前提）单测环境没有 mihomo 内核', existsSync(config.mihomoBin), false);
+
+    store.updateSettings({ proxyEnabled: true, proxyBlockOnFailure: true });
+    let r = await proxy.applyProxySettings();
+    eq('内核起不来时 running=false', r.running, false);
+    eq('★ 默认（要阻断）仍指向代理，绝不擅自回退直连', proxy.isProxying(), true);
+    eq('★ 此时闸拦住请求', typeof (await proxy.proxyBlocksRequest()), 'string');
+
+    store.updateSettings({ proxyBlockOnFailure: false });
+    r = await proxy.applyProxySettings();
+    eq('内核仍起不来', r.running, false);
+    eq('★ 用户明确选了回退时才切回直连', proxy.isProxying(), false);
+    eq('★ 回退时闸不再拦', await proxy.proxyBlocksRequest(), null);
+
+    // 「还没订阅」是另一条同型分支，同样不能放行直连
+    try {
+      unlinkSync(subFile);
+    } catch {
+      /* 本来就不存在 */
+    }
+    store.updateSettings({ proxyEnabled: true, proxyBlockOnFailure: true, proxySubscriptionUrl: '' });
+    r = await proxy.applyProxySettings();
+    eq('没有订阅时 running=false', r.running, false);
+    eq('★ 没有订阅也保持指向代理', proxy.isProxying(), true);
+
+    // 收尾：关掉伪装（顺带把全局 dispatcher 复位成直连，别影响后面的用例）
+    store.updateSettings({ proxyEnabled: false, proxyBlockOnFailure: true });
+    await proxy.applyProxySettings();
+    eq('收尾：关掉伪装后回到直连', proxy.isProxying(), false);
+  }
 }
 
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);

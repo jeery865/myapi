@@ -36,6 +36,7 @@ import { isOpencodeModel, stripPrefix, withPrefix, nativeProtocol } from './mode
 import { isClineModel, stripClinePrefix } from './models-cline.js';
 import { buildClineEnv } from './cline.js';
 import { adapterFor, callUpstreamApi, classifyUpstreamFailure } from './protocols/index.js';
+import { proxyBlocksRequest, isProxying } from './proxy.js';
 import { rotationRule, nextCursor, setRotationRule } from './upstreams.js';
 import {
   anthropicToChat,
@@ -760,6 +761,36 @@ async function dispatchApi(req, res, url) {
     return callUpstreamApi(p.customUp, { chatBody, model: bare, apiKey: acct.token });
   };
 
+  // 出口代理开着但内核不在 —— 直接拒绝，别往下走。
+  //
+  // 放在最前面（连 /v1/models 都不放过）：下面每条路径都会 await worker.fetch()，
+  // 而内核没起来时 dispatcher 可能是直连的 —— 那就有可能从真实出口出去。
+  // 「伪装」的前提是宁可整个失败，也不能漏。控制台看模型列表走的是 /admin/api，
+  // 不经过这里，所以拦掉不影响运维。
+  //
+  // 另外这也顺手挡住了一件事：往下是个换号循环，出口坏掉会让池子里每个号都白失败
+  // 一次（浪费时间还刷日志），而这类失败**不该有机会写账号状态** —— 代理是所有账号
+  // 共用的出口，它坏了不该由某个号来背（否则整池被标坏号，且状态里的冷却到期后
+  // 探活也要走代理、继续失败，永远好不了）。
+  if (store.settings?.proxyEnabled) {
+    const blocked = await proxyBlocksRequest();
+    if (blocked) {
+      if (keyRecord?.id) store.touchKey(keyRecord.id);
+      send(
+        res,
+        503,
+        {
+          error: {
+            message: `出口代理不可用（${blocked}）。「伪装 IP」已开启，为避免暴露真实出口，本次请求已拒绝。请到控制台「出口代理」检查内核与节点。`,
+            type: 'proxy_unavailable',
+          },
+        },
+        { 'x-myapi-proxy': 'down' }
+      );
+      return;
+    }
+  }
+
   // 模型列表和 count_tokens 都不碰上游、不占额度，不需要账号
   if (isModelList || isCountTokens) {
     // opencode / cline 都没有 count_tokens 接口，模型 id 也不在 freebuff 引擎的表里
@@ -859,6 +890,8 @@ async function dispatchApi(req, res, url) {
   // 但 x-myapi-accounts-tried 要的是"这次用了几个号"，得单独数
   let attempts = 0;
   let usedPlan = plan;
+  // 出口代理链路失败（节点挂了 / 内核退出）。见下面 catch 里的判断。
+  let proxyFailure = '';
 
   roundLoop: for (const roundModel of roundModels) {
     const p = plansByModel.get(roundModel);
@@ -876,6 +909,14 @@ async function dispatchApi(req, res, url) {
         resp = await callUpstream(acct, p);
       } catch (err) {
         console.error(`[engine] 上游异常 ${pathname} (${acct.id}): ${err.message}`);
+        // 「伪装 IP」开着时，抛异常基本只有一个解释：**出口链路坏了**
+        // （节点挂了 / 内核退出 / 目标被节点拒掉）。换号走的是同一个出口，白试 ——
+        // 所以当场中断，别把整池账号挨个撞一遍。
+        // 顺带也是账号状态的保护：这条路径本来就不写状态，中断只是让它更早结束。
+        if (isProxying()) {
+          proxyFailure = err.message;
+          break roundLoop;
+        }
         last = { status: 502, text: `上游异常: ${err.message}`, acct, state: 'upstream_error' };
         tried.push(`${acct.id}:exception`);
         if (roundManual) break;
@@ -923,6 +964,20 @@ async function dispatchApi(req, res, url) {
     console.warn(
       `[engine] ${pathname} 模型 ${clientModel} 全部账号失败（${last?.state}），降级重试：${fallbackIds.join(', ')}`
     );
+  }
+
+  if (!hit && proxyFailure) {
+    // 出口挂了：不回 502「上游失败」（会让人以为是上游或账号的问题），
+    // 也不带 x-myapi-accounts-tried —— 一个号都没真正用上。
+    console.warn(`[engine] ${pathname} 出口代理链路失败，已中断换号：${proxyFailure}`);
+    track({ acct: null, status: 503, ok: false, error: `proxy: ${proxyFailure}` });
+    send(
+      res,
+      503,
+      errorBody(pathname, `出口代理链路失败（${proxyFailure}）。换号解决不了这个问题 —— 所有账号走的是同一个出口。请到控制台「出口代理」检查内核与节点。`, 503),
+      { 'x-myapi-proxy': 'failed' }
+    );
+    return;
   }
 
   if (!hit) {

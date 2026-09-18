@@ -20,6 +20,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates tini xvfb xauth fonts-liberation fonts-noto-core fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# ── 出口代理内核 mihomo（「伪装 IP / Clash 订阅」功能用）────────────────────────
+# 用 node 下载而不是 curl：node:22-bookworm-slim 不带 curl/wget，为它单独装个包不划算。
+# 版本固定，保证构建可复现（和 vendor/ 下那两个引擎一样，不跟 latest）。
+# 按目标架构选二进制：Railway 现在是 amd64，但别写死，换 arm 机器就废了。
+# 只有 HTTP/SOCKS 混合端口模式，不需要 NET_ADMIN 之类的特权。
+ARG MIHOMO_VERSION=v1.19.31
+ENV MIHOMO_VERSION=${MIHOMO_VERSION}
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64|amd64) ARCH=amd64 ;; \
+      aarch64|arm64) ARCH=arm64 ;; \
+      *) echo "unsupported arch: $(uname -m)"; exit 1 ;; \
+    esac; \
+    node -e '(async()=>{const fs=require("fs"),zlib=require("zlib"),{pipeline}=require("stream/promises"),{Readable}=require("stream");const v=process.env.MIHOMO_VERSION,a=process.argv[1];const u=`https://github.com/MetaCubeX/mihomo/releases/download/${v}/mihomo-linux-${a}-${v}.gz`;console.log("downloading "+u);const r=await fetch(u,{redirect:"follow"});if(!r.ok)throw new Error("HTTP "+r.status);await pipeline(Readable.fromWeb(r.body),zlib.createGunzip(),fs.createWriteStream("/usr/local/bin/mihomo"));})().catch(e=>{console.error("mihomo 下载失败: "+e.message);process.exit(1)})' "$ARCH"; \
+    chmod +x /usr/local/bin/mihomo; \
+    /usr/local/bin/mihomo -v
+
 COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; \
     else npm install --omit=dev --no-audit --no-fund; fi

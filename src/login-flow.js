@@ -8,7 +8,7 @@
 import { randomBytes } from 'node:crypto';
 import { config } from './config.js';
 import { store } from './store.js';
-import { httpJson, randomId, nowIso } from './util.js';
+import { httpJson, randomId, nowIso, isPublicHttpUrl } from './util.js';
 
 const flows = new Map(); // id -> flow
 const FLOW_TTL_MS = 30 * 60 * 1000;
@@ -129,14 +129,9 @@ function assertPublicHttps(raw, label = '上游返回的登录链接') {
   let u;
   try {
     u = new URL(String(raw));
-    const host = u.hostname.toLowerCase();
-    const privateHost =
-      host === 'localhost' ||
-      host.endsWith('.localhost') ||
-      host.endsWith('.internal') ||
-      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) ||
-      host === '::1';
-    if (u.protocol !== 'https:' || privateHost) throw new Error('协议或地址不可信');
+    // 校验逻辑提到 util.isPublicHttpUrl 里了（Clash 订阅地址也要用同一道闸），
+    // 这里的语义没变：必须 https，且不能是内网 / 回环 / 本地域名。
+    if (!isPublicHttpUrl(u, { requireHttps: true })) throw new Error('协议或地址不可信');
   } catch (err) {
     throw Object.assign(new Error(`${label}不可信（${err.message}），已中止`), { statusCode: 502 });
   }

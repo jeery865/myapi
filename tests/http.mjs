@@ -486,5 +486,37 @@ if (bulkUp?.upstream) {
   await admin(`/upstreams/${upId}`, 'DELETE');
 }
 
+// ── 出口代理：自检是**真实请求**，必须过闸 ──
+// 伪装开着但内核没跑时，自检绝不能从真实 IP 出去（它传的还是整池 token）。
+// 这条放在最末尾：开启伪装后 engine 的 API 路径会被 503 拦，会污染后面的用例。
+{
+  await admin('/accounts', 'POST', { token: 'fake-selftest-token-000001', provider: 'freebuff' });
+  await admin('/settings', 'PATCH', { proxyEnabled: true });
+
+  const st = await admin('/state');
+  check('伪装开着时 /state 带上了代理状态', typeof st.json?.proxy?.enabled === 'boolean', JSON.stringify(st.json?.proxy));
+  check('（前提）内核没在跑，所以闸应该拦', st.json?.proxy?.enabled === true && st.json?.proxy?.running === false, JSON.stringify(st.json?.proxy));
+
+  const sel = await admin('/selftest', 'POST', { model: 'deepseek/deepseek-v4-flash' });
+  check('自检被闸拦住（不从真实出口出去）', sel.status === 503, `${sel.status} ${JSON.stringify(sel.json)}`);
+  check('错误指明是出口代理的问题', /出口代理不可用/.test(sel.json?.error || ''), sel.json?.error || '');
+  check('自检没有真的打上游（ok 不为 true）', sel.json?.ok !== true, JSON.stringify(sel.json));
+
+  // 探活同理：出口坏掉不该由某个号来背，所以既不写状态也不真发请求
+  const accs = (await admin('/state')).json?.accounts || [];
+  const target = accs.find((a) => a.provider === 'freebuff');
+  if (target) {
+    const before = JSON.stringify(target.status ?? null);
+    const probe = await admin(`/accounts/${target.id}/check`, 'POST');
+    check('出口不可用时手动探活被拒', /出口代理不可用/.test(probe.json?.probe?.verdict || ''), JSON.stringify(probe.json));
+    check('被拒的探活不落账号状态（status 保持 null）', probe.json?.status === null, JSON.stringify(probe.json?.status));
+    const afterAcc = ((await admin('/state')).json?.accounts || []).find((a) => a.id === target.id);
+    check('被拦的探活没有改动账号状态', JSON.stringify(afterAcc?.status ?? null) === before, `${JSON.stringify(afterAcc?.status)} vs ${before}`);
+  }
+
+  await admin('/settings', 'PATCH', { proxyEnabled: false });
+  await admin(`/accounts/${target ? target.id : ''}`, 'DELETE').catch(() => {});
+}
+
 console.log(`\n集成测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

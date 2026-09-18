@@ -1001,6 +1001,44 @@ dialog[open] { animation: dlgIn 0.28s var(--ease) both; }
   flex-direction: column;
   gap: 5px;
 }
+
+/* 出口代理的节点列表。一行一个节点、点一下就切过去，所以整行要是可点区域；
+   用左边一个小圆点表示探活结果，右侧两列是协议和延迟/当前标记 */
+.pxnode {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  margin: 0 -9px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background .15s var(--ease);
+}
+.pxnode:hover { background: var(--panel-2); }
+.pxnode.on { background: rgba(127, 180, 232, 0.08); }
+.pxdot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal);
+}
+.pxdot.off { background: var(--alarm); opacity: .6; }
+.pxnm {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.pxnode.on .pxnm { color: var(--link); }
+.pxmeta {
+  color: var(--muted-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
 /* 三列：类别 / 占比条 / 字节数。条子让"谁占得多"不用读数字就看得出来。
    条子给个上限宽度 —— 铺满整行反而显得空，而且把标签挤没了 */
 .storelist .si {

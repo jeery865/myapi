@@ -26,6 +26,16 @@ import { fetchUpstreamModels, probeUpstreamKey } from './protocols/index.js';
 import { startFlow, getFlow, cancelFlow, publicFlow, startOpencodeFlow, finishOpencodeFlow, startClineFlow } from './login-flow.js';
 import { browserFeature, startBrowserForFlow, getSession } from './browser.js';
 import { usage } from './usage.js';
+import {
+  getProxyStatus,
+  fetchSubscription,
+  clearSubscription,
+  listNodes,
+  selectNode,
+  testDelay,
+  applyProxySettings,
+  proxyBlocksRequest,
+} from './proxy.js';
 import { chatLogStatus, chatLogFiles, recentChats, readChatLogFile, clearChatLog } from './chatlog.js';
 import { inspectStorage, cleanupPreview, runCleanup } from './maintenance.js';
 import {
@@ -158,6 +168,20 @@ function keyView(k) {
  * 导出只为测试（`tests/unit.mjs` 里断言 cline 的结论不带 noProbe 之外的副作用）。
  */
 export async function checkAccount(acct) {
+  // 出口代理开着但不可用：这时候探活必然全失败，而那种失败**不该由账号来背**
+  // （代理是所有号共用的出口）。不加这道闸的话，一次「检测全部」会把整池刷成
+  // network_error —— 号一个都没坏，是出口坏了。返回 noProbe（不落库），
+  // 让用户去修出口，而不是去删号。
+  const proxyBlocked = await proxyBlocksRequest().catch(() => null);
+  if (proxyBlocked) {
+    return {
+      state: 'unknown',
+      noProbe: true,
+      verdict: '出口代理不可用',
+      detail: `「伪装 IP」已开启但代理不可用（${proxyBlocked}），本次不做探活 —— 免得把好号误判成坏号。请先到「出口代理」检查内核与节点。`,
+      httpStatus: 0,
+    };
+  }
   const prov = providerOf(acct);
   if (prov === 'opencode') return probeOpencodeKey(acct.token);
   if (prov === 'freebuff') return probeAccount(acct.token);
@@ -185,6 +209,8 @@ const PROBE_CONCURRENCY = 6;
 // /state 里最多带这么多个账号。号池能有几千个 key，全量下发会让每 20 秒一次的
 // 轮询变成 MB 级流量，而控制台一屏也看不完 —— 超出的用 /accounts/page 按需取。
 const ACCOUNT_PAGE = 200;
+// 改到这些设置项要让出口代理重算（起/停内核、切 dispatcher），光写 store 不生效
+const PROXY_SETTING_KEYS = ['proxyEnabled', 'proxySubscriptionUrl', 'proxyBlockOnFailure', 'proxySelectedNode'];
 
 async function checkAccounts(accounts) {
   const results = [];
@@ -305,7 +331,12 @@ async function buildState(req) {
       volume: config.railwayVolume || null,
     },
     browser: browserFeature(),
-    settings: store.settings,
+    proxy: getProxyStatus(),
+    // 订阅 URL 里几乎一定带机场的凭据（token/key），而 /state 是每 20 秒拉一次、
+    // 会经过浏览器缓存与反向代理的东西 —— 所以**只下发 host**（在 proxy.subscriptionHost 里）。
+    // 前端要显示"是否已配"就看 proxy.hasSubscription，要改就整个覆盖。
+    settings: { ...store.settings, proxySubscriptionUrl: '' },
+    proxySubscriptionUrlSet: Boolean(store.settings?.proxySubscriptionUrl),
     accounts: (sliced ? allAccounts.slice(0, ACCOUNT_PAGE) : allAccounts).map((a) => accountView(a, workerStates)),
     accountsTotal: allAccounts.length,
     accountsTruncated: sliced,
@@ -549,7 +580,76 @@ export async function handleAdminApi(req, res, url) {
   // --- 设置 / 模型 ---
   if (path === '/settings' && method === 'PATCH') {
     const body = await readJson(req, 256 * 1024);
-    return sendJson(res, 200, { ok: true, settings: store.updateSettings(body) });
+    const settings = store.updateSettings(body);
+    // 出口代理那几个字段光写进 store 不生效 —— 得起/停内核、切 dispatcher，所以重算一遍
+    if (PROXY_SETTING_KEYS.some((k) => k in body)) await applyProxySettings().catch(() => {});
+    return sendJson(res, 200, { ok: true, settings });
+  }
+
+  // --- 出口代理（Clash 订阅 → mihomo）---
+
+  if (path === '/proxy/status' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, proxy: getProxyStatus() });
+  }
+
+  if (path === '/proxy/subscription' && method === 'POST') {
+    const body = await readJson(req, 64 * 1024);
+    const url = String(body.url || '').trim();
+    const settings = store.updateSettings({ proxySubscriptionUrl: url });
+    if (!url) {
+      // 清空订阅：落盘文件也删掉，免得下次开启伪装时又用回旧节点
+      clearSubscription();
+      await applyProxySettings().catch(() => {});
+      return sendJson(res, 200, { ok: true, settings, proxy: getProxyStatus() });
+    }
+    // updateSettings 校验不过会静默保留原值，这里对比一下就知道了
+    if (settings.proxySubscriptionUrl !== url) {
+      return sendJson(res, 400, { ok: false, error: '订阅地址不合法：必须是 https 公网地址', proxy: getProxyStatus() });
+    }
+    try {
+      const { bytes } = await fetchSubscription(url);
+      const applied = await applyProxySettings();
+      const nodes = applied.running ? await listNodes().then((d) => d.nodes).catch(() => []) : [];
+      return sendJson(res, 200, { ok: true, bytes, nodes: nodes.length, proxy: getProxyStatus() });
+    } catch (err) {
+      // 拉订阅失败不致命：内核维持现状（或保持未启动），把原因如实给控制台
+      return sendJson(res, err.statusCode || 502, { ok: false, error: err.message, proxy: getProxyStatus() });
+    }
+  }
+
+  if (path === '/proxy/nodes' && method === 'GET') {
+    try {
+      const data = await listNodes();
+      return sendJson(res, 200, { ok: true, ...data, proxy: getProxyStatus() });
+    } catch (err) {
+      return sendJson(res, 502, { ok: false, error: err.message, proxy: getProxyStatus() });
+    }
+  }
+
+  if (path === '/proxy/nodes/select' && method === 'POST') {
+    const body = await readJson(req, 16 * 1024);
+    try {
+      const r = await selectNode(body.name);
+      return sendJson(res, 200, { ok: true, ...r });
+    } catch (err) {
+      return sendJson(res, err.statusCode || 502, { ok: false, error: err.message });
+    }
+  }
+
+  if (path === '/proxy/nodes/delay' && method === 'POST') {
+    const body = await readJson(req, 16 * 1024);
+    try {
+      const r = await testDelay(body.name);
+      return sendJson(res, 200, { ok: true, ...r });
+    } catch (err) {
+      return sendJson(res, err.statusCode || 502, { ok: false, error: err.message });
+    }
+  }
+
+  // 手动重启内核（节点全挂、或自动重启到上限之后用这个救回来）
+  if (path === '/proxy/reload' && method === 'POST') {
+    const applied = await applyProxySettings();
+    return sendJson(res, 200, { ok: true, ...applied, proxy: getProxyStatus() });
   }
 
   if (path === '/models' && method === 'GET') {
@@ -679,6 +779,17 @@ export async function handleAdminApi(req, res, url) {
   if (path === '/selftest' && method === 'POST') {
     const body = await readJson(req, 16 * 1024);
     const model = String(body.model || 'deepseek/deepseek-v4-flash');
+    // ⚠️ 自检是**真实请求**（下面两条分支都会打到上游），所以它必须过闸。
+    //   漏掉这条的后果：出口代理开着但内核挂了时，自检会从**真实 IP** 出去，
+    //   而且 `tokens` 传的是整池 —— 一次自检等于把整个号池暴露一次。
+    //   这与「宁可失败也不暴露」直接冲突，也不该由某个号来背出口的锅。
+    const proxyBlocked = await proxyBlocksRequest().catch(() => null);
+    if (proxyBlocked) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: `出口代理不可用（${proxyBlocked}）。自检需要真的打一次上游，不能从真实出口出去，已取消。请到「出口代理」检查内核与节点。`,
+      });
+    }
     const accounts = eligibleAccounts(model);
     if (!accounts.length) return sendJson(res, 400, { ok: false, error: '账号池里没有可用账号' });
     const started = Date.now();

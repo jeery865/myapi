@@ -282,6 +282,9 @@ function show(view) {
   if (location.hash.slice(1) !== view) history.replaceState(null, '', `#${view}`);
   window.scrollTo({ top: 0 });
   if (view === 'usage') loadUsage();
+  // 出口代理的节点列表要打 mihomo 的 API，所以只在进设置页时拉一次，
+  // 不跟 20 秒的后台刷新绑在一起
+  if (view === 'settings') loadProxyNodes();
   if (view === 'settings') loadStorage();
 }
 
@@ -1431,6 +1434,24 @@ function renderSettings(s) {
   $('#set-freeze').checked = Boolean(s.settings.accountFreezeEnabled);
   const freezeMin = Number(s.settings.accountFreezeMinutes);
   $('#set-freezemin').value = Number.isFinite(freezeMin) ? freezeMin : 30;
+  // 出口代理（伪装 IP）。订阅 URL 服务端只回 host（里面常带机场凭据），
+  // 所以输入框保持空、用 placeholder 说明"已经配过了"。
+  const px = s.proxy || {};
+  $('#set-px').checked = Boolean(px.enabled);
+  $('#set-pxblock').checked = px.blockOnFailure !== false;
+  $('#set-pxurl').placeholder = s.proxySubscriptionUrlSet
+    ? `已保存：${px.subscriptionHost || '(地址不合法)'} —— 填新地址可替换`
+    : 'https://example.com/clash';
+  $('#px-state').textContent = px.enabled
+    ? px.running
+      ? px.proxying
+        ? `已开启 · 流量走代理 · :${px.mixedPort}`
+        : '已开启 · 内核在跑但流量未切换'
+      : '⚠️ 已开启但内核没跑 —— 请求会被拒绝'
+    : '直连';
+  $('#px-state').style.color = px.enabled && !px.running ? 'var(--alarm)' : '';
+  const pxBtn = $('#btn-px-save');
+  if (pxBtn) pxBtn.disabled = false;
   // 目录和持久性挤在一行：持久性是这个目录的属性，分成两行反而要来回看
   $('#s-datadir').textContent = `${s.storage.dir}　${s.storage.persistent ? '持久' : '临时 · 重新部署会清空'}`;
   $('#s-persist-note').textContent = s.storage.volume
@@ -1645,6 +1666,152 @@ $('#set-freezemin').addEventListener('change', async (ev) => {
     sync(true);
   }
 });
+// ─── 出口代理（伪装 IP）────────────────────────────────────────────────────
+// 节点列表要打 mihomo 的 API，所以按需拉，不塞进 /state（那会让每 20 秒的轮询变重）。
+
+let proxyNodesBusy = false;
+
+async function loadProxyNodes() {
+  const box = $('#px-nodes');
+  if (!box) return;
+  const px = STATE.proxy || {};
+  if (!px.enabled) {
+    box.innerHTML = '<div class="muted small">伪装 IP 关着，出站走直连。</div>';
+    $('#px-note').textContent =
+      px.kernelAvailable === false
+        ? '镜像里没找到 mihomo 内核 —— 需要重新部署（Dockerfile 会装好它）。'
+        : '开启后这里会列出订阅里的节点。';
+    return;
+  }
+  // 内核没跑时别去发这个注定失败的请求：直接把原因显示出来。
+  // 顺带避免每次切进设置页都撞一次 503（切来切去会反复触发，看着像控制台坏了）。
+  if (!px.running) {
+    box.innerHTML = '<div class="muted small">内核没在运行，暂时读不到节点列表。</div>';
+    $('#px-note').textContent = px.lastError || '点下面的「重新加载」把内核拉起来。';
+    return;
+  }
+  // 切视图够快时可能连着进来几次，同一份列表不用发两遍
+  if (proxyNodesBusy) return;
+  proxyNodesBusy = true;
+  try {
+    const d = await api('/proxy/nodes');
+    const nodes = Array.isArray(d.nodes) ? d.nodes : [];
+    box.innerHTML = nodes.length
+      ? nodes
+          .map((n) => {
+            const cur = n.name === d.current;
+            return `<div class="pxnode${cur ? ' on' : ''}" data-node="${esc(n.name)}">
+              <span class="pxdot${n.alive ? '' : ' off'}"></span>
+              <span class="pxnm">${esc(n.name)}</span>
+              <span class="pxmeta">${esc(n.type)}</span>
+              <span class="pxmeta">${cur ? '当前' : n.delay != null ? `${n.delay}ms` : '未测'}</span>
+            </div>`;
+          })
+          .join('')
+      : '<div class="muted small">订阅里没有节点。确认订阅是 Clash 格式（有 <code>proxies:</code> 段），再点「保存并拉取」。</div>';
+    const alive = nodes.filter((n) => n.alive).length;
+    $('#px-note').textContent = nodes.length
+      ? `共 ${nodes.length} 个节点，${alive} 个探活通过${px.running ? '' : ' · ⚠️ 内核当前没在跑，请求会被拒绝'}`
+      : px.lastError || '';
+  } catch (err) {
+    box.innerHTML = `<div class="muted small">读节点失败：${esc(err.message)}</div>`;
+  } finally {
+    proxyNodesBusy = false;
+  }
+}
+
+$('#set-px').addEventListener('change', async (ev) => {
+  const on = ev.target.checked;
+  try {
+    const r = await api('/settings', { method: 'PATCH', body: { proxyEnabled: on } });
+    if (on && r.settings && r.settings.proxySubscriptionUrl === '' && !STATE.proxy?.hasSubscription) {
+      toast('已开启伪装 IP —— 但没有订阅内容，请填订阅地址并拉取；在那之前请求会被拒绝', 'warn', 9000);
+    } else {
+      toast(on ? '已开启伪装 IP：出站走订阅节点' : '已关闭伪装 IP：出站回到直连');
+    }
+    await sync(true);
+    await loadProxyNodes();
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+
+$('#set-pxblock').addEventListener('change', async (ev) => {
+  const on = ev.target.checked;
+  try {
+    await api('/settings', { method: 'PATCH', body: { proxyBlockOnFailure: on } });
+    toast(on ? '已保存：代理不可用时拒绝请求（不暴露真实出口）' : '已保存：代理不可用时回退直连（会暴露真实 IP）', on ? 'ok' : 'warn');
+  } catch (err) {
+    toast(err.message, 'err');
+    sync(true);
+  }
+});
+
+$('#btn-px-save').addEventListener('click', async () => {
+  const btn = $('#btn-px-save');
+  const url = $('#set-pxurl').value.trim();
+  btn.disabled = true;
+  btn.textContent = '拉取中…';
+  try {
+    const r = await api('/proxy/subscription', { method: 'POST', body: { url } });
+    $('#set-pxurl').value = '';
+    toast(
+      url
+        ? `订阅已更新：${r.bytes} 字节，${r.nodes || 0} 个节点`
+        : '已清空订阅并停用节点'
+    );
+    await sync(true);
+    await loadProxyNodes();
+  } catch (err) {
+    toast(err.message, 'err', 9000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '保存并拉取';
+  }
+});
+
+$('#btn-px-refresh').addEventListener('click', async () => {
+  const btn = $('#btn-px-refresh');
+  btn.disabled = true;
+  try {
+    await loadProxyNodes();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#btn-px-reload').addEventListener('click', async () => {
+  const btn = $('#btn-px-reload');
+  btn.disabled = true;
+  btn.textContent = '重启中…';
+  try {
+    const r = await api('/proxy/reload', { method: 'POST' });
+    toast(r.running ? '内核已重启，流量走代理' : `内核没起来：${r.error || '未知原因'}`, r.running ? 'ok' : 'err', 8000);
+    await sync(true);
+    await loadProxyNodes();
+  } catch (err) {
+    toast(err.message, 'err', 8000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '重载内核';
+  }
+});
+
+$('#px-nodes').addEventListener('click', async (ev) => {
+  const row = ev.target.closest('[data-node]');
+  if (!row) return;
+  const name = row.dataset.node;
+  try {
+    await api('/proxy/nodes/select', { method: 'POST', body: { name } });
+    toast(`已切到节点「${name}」`);
+    await sync(true);
+    await loadProxyNodes();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+});
+
 $('#btn-export').addEventListener('click', async () => {
   const btn = $('#btn-export');
   btn.disabled = true;

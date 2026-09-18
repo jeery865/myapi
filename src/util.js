@@ -1,8 +1,99 @@
 // 通用小工具：没有第三方依赖，全部基于 node 标准库。
 import { randomBytes, createHmac, timingSafeEqual, createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+/**
+ * 这个 IP 是不是「非公网」（回环 / 私有 / 链路本地 / CGNAT / 组播 / 保留段）。
+ *
+ * 为什么不能只靠正则匹配点分十进制：同一个地址有很多写法，而且 IPv6 段更隐蔽。
+ *   · 十进制 / 十六进制（2130706433、0x7f000001）—— WHATWG URL 会规范化成 127.0.0.1，能挡住，
+ *     但校验函数被直接调用时不一定经过 URL，所以这里对 IPv4 数字再做一次判断更保险。
+ *   · IPv4 映射的 IPv6（::ffff:127.0.0.1，URL 规范化后是 ::ffff:7f00:1）—— 老正则会漏。
+ *   · IPv6 的 ULA（fc00::/7）与链路本地（fe80::/10）—— 老正则完全没覆盖。
+ * 判不出来的一律当「非公网」（保守），宁可拒掉一个合法地址也不能放进来一个内网地址。
+ */
+export function isPrivateIp(ip) {
+  const v = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!v) return true;
+
+  // IPv4 映射 / 兼容形式的 IPv6：取其后 32 位按 IPv4 再判一次
+  const mappedV4 = v.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/);
+  if (mappedV4) return isPrivateIp(mappedV4[1]);
+  // ::ffff:7f00:1 这种十六进制尾巴（URL 规范化后的形态）
+  if (v.startsWith('::ffff:')) {
+    const tail = v.slice(7).split(':');
+    if (tail.length === 2 && tail.every((p) => /^[0-9a-f]{1,4}$/.test(p))) {
+      const hi = parseInt(tail[0], 16);
+      const lo = parseInt(tail[1], 16);
+      return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
+    return true; // 形状不认识，保守拒掉
+  }
+
+  if (isIP(v) === 4) {
+    const [a, b] = v.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127) return true; // 0.0.0.0/8、10/8、回环
+    if (a === 169 && b === 254) return true; // 链路本地（云元数据 169.254.169.254 就在这）
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 192 && b === 0) return true; // 192.0.0/24 + 192.0.2/24（保留/文档段）
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a >= 224) return true; // 组播 + 保留（含 255.255.255.255）
+    return false;
+  }
+
+  if (isIP(v) === 6) {
+    if (v === '::' || v === '::1') return true;
+    const head = parseInt(v.split(':')[0] || '0', 16);
+    if (!Number.isFinite(head)) return true;
+    if ((head & 0xfe00) === 0xfc00) return true; // ULA fc00::/7
+    if ((head & 0xffc0) === 0xfe80) return true; // 链路本地 fe80::/10
+    if ((head & 0xff00) === 0xff00) return true; // 组播 ff00::/8
+    return false;
+  }
+
+  return true; // 不是合法 IP
+}
+
+/**
+ * 是不是「公网 http(s) 地址」。
+ *
+ * 服务端会拿这类地址去发请求（上游给的登录链接、用户填的 Clash 订阅），
+ * 所以必须挡住内网 / 回环 / 本地域名 —— 否则等于开了个 SSRF 口子，
+ * 让人借我们的进程去探测容器内网（Railway 内网、云元数据端点都在射程内）。
+ *
+ * requireHttps=true 只认 https（凭据类 URL 用这个）。
+ *
+ * ⚠️ 这只是**字面上**能判的部分：域名本身是不是解析到内网，这一层看不出来
+ * （`evil.example.com` 完全可以 A 记录指向 127.0.0.1）。发请求前还要做一次
+ * 「解析出来的 IP 必须也是公网」的校验，见 src/proxy.js 的 assertPublicTarget()。
+ */
+export function isPublicHttpUrl(value, { requireHttps = false } = {}) {
+  let u;
+  try {
+    u = value instanceof URL ? value : new URL(String(value));
+  } catch {
+    return false;
+  }
+  if (requireHttps ? u.protocol !== 'https:' : !/^https?:$/.test(u.protocol)) return false;
+
+  // URL.hostname 对 IPv6 会带方括号，先剥掉。
+  // 再去掉**尾点**：`metadata.google.internal.` 是合法的 root-anchored 写法，
+  // 但 `endsWith('.internal')` 判不到它 —— 不归一就等于给后缀黑名单开了个后门。
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal') || host.endsWith('.local')) {
+    return false;
+  }
+  // 是 IP 字面量就交给 isPrivateIp 统一判（它覆盖 IPv6，且对数字写法更稳）
+  if (isIP(host)) return !isPrivateIp(host);
+  // 外观像数字 IP（十进制 / 十六进制 / 八进制）但没被 URL 规范化成点分形式的，一律拒
+  if (/^[0-9]+$/.test(host) || /^0x[0-9a-f]+$/.test(host) || /^0[0-7]+$/.test(host)) return false;
+
+  return true;
 }
 
 export function randomId(bytes = 8) {

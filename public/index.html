@@ -326,6 +326,49 @@
       </div>
 
       <div class="setgroup">
+        <div class="eyebrow"><b>出口代理</b><span>EGRESS</span>
+          <span class="eyebrow-note" id="px-state">—</span>
+        </div>
+        <div class="setlist">
+          <div class="setrow">
+            <span class="sk">伪装 IP</span>
+            <div class="sv">
+              <label class="inline-toggle"><input type="checkbox" class="switch" id="set-px"><span>出站请求走 Clash 订阅里的节点</span></label>
+              <p class="sh">默认关（直连）。开启后所有出站请求从节点 IP 出去。注意这只换了出口地址，「同一个出口 + 多个账号」这个模式本身没变 —— 真正影响账号存活的是请求密度和号池规模。</p>
+            </div>
+          </div>
+          <div class="setrow">
+            <span class="sk">订阅地址</span>
+            <div class="sv">
+              <input type="text" id="set-pxurl" placeholder="https://example.com/clash" autocomplete="off" spellcheck="false">
+              <p class="sh">Clash 格式订阅（含 <code>proxies:</code> 段）。原文只落在数据目录，不写进 /state、不进日志。保存时立即拉取一次。</p>
+            </div>
+            <div class="sa">
+              <button class="btn" id="btn-px-save">保存并拉取</button>
+            </div>
+          </div>
+          <div class="setrow">
+            <span class="sk">节点</span>
+            <div class="sv">
+              <div id="px-nodes" class="storelist"></div>
+              <p class="sh" id="px-note">—</p>
+            </div>
+            <div class="sa">
+              <button class="btn" id="btn-px-refresh">刷新节点</button>
+              <button class="btn" id="btn-px-reload">重载内核</button>
+            </div>
+          </div>
+          <div class="setrow">
+            <span class="sk">失败处理</span>
+            <div class="sv">
+              <label class="inline-toggle"><input type="checkbox" class="switch" id="set-pxblock"><span>代理不可用时拒绝请求</span></label>
+              <p class="sh">默认开：宁可整个请求失败，也不让流量从真实出口走。关掉就自动回退直连 —— 那段时间会暴露真实 IP。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="setgroup">
         <div class="eyebrow"><b>聊天记录</b><span>TRANSCRIPTS</span>
           <span class="eyebrow-note" id="s-chat-state">—</span>
         </div>

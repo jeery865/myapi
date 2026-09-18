@@ -17,6 +17,7 @@ import { handleApiRequest, callWorker } from './engine.js';
 import { getSession, closeAllBrowsers, browserFeature } from './browser.js';
 import { refreshCatalog, noteEngineModelList } from './models.js';
 import { startScheduler, startRescueScheduler } from './scheduler.js';
+import { initProxy, shutdownProxy } from './proxy.js';
 import { sendJson, sendText, publicBaseUrl } from './util.js';
 
 const MIME = {
@@ -263,6 +264,11 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
     // 放在监听之后启动 —— 网络已经就绪，早起的 tick 不会白跑。
     startScheduler();
     startRescueScheduler();
+    // 出口代理：配置了订阅且开关打开就起 mihomo 内核、把出站切过去。
+    // 不 await —— 内核启动要几百毫秒到十几秒，不该拖住 HTTP 就绪；
+    // 启动期间 dispatcher 已经指向代理端口了（见 applyProxySettings 里的顺序说明），
+    // 所以那几秒进来的请求是失败而不是漏真实出口。
+    initProxy().catch((err) => console.error('[myapi] 出口代理初始化失败：', err.message));
   };
 
   // 先试 IPv6 双栈，不行再退 IPv4；两个都失败才退出（并把原因打清楚）
@@ -288,6 +294,7 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
     console.log(`[myapi] 收到 ${signal}，正在收尾…`);
     store.saveNow();
     usage.saveNow();
+    shutdownProxy();
     await closeAllBrowsers().catch(() => {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 8000);

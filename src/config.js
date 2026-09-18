@@ -79,6 +79,15 @@ export const config = {
   browserProxy: (process.env.BROWSER_PROXY || '').trim(),
   browserIdleTimeoutMs: parseInt(process.env.BROWSER_IDLE_TIMEOUT_MS || '600000', 10),
 
+  // ── 出口代理：Clash 订阅 → mihomo 内核 → 本地混合端口 ──────────────────────
+  // 内核二进制由 Dockerfile 装到 /usr/local/bin/mihomo（本机开发可用 MIHOMO_BIN 指过去）。
+  // 没装也不该影响服务启动 —— 功能被判为不可用，控制台给提示即可。
+  // 两个端口只监听回环，且 mihomo 的 allow-lan 强制 false，容器不会变成开放代理。
+  clashDir: resolve(dataDir.dir, 'clash'),
+  mihomoBin: (process.env.MIHOMO_BIN || '/usr/local/bin/mihomo').trim(),
+  clashMixedPort: positiveInt(process.env.CLASH_MIXED_PORT, 7890, { min: 1024, max: 65535 }),
+  clashApiPort: positiveInt(process.env.CLASH_API_PORT, 9090, { min: 1024, max: 65535 }),
+
   // 单个 API 请求的体积上限：JSON.parse 会把内存放大好几倍，太大很容易把小容器打满
   maxBodyBytes: Math.max(1, parseFloat(process.env.MAX_BODY_MB || '8')) * 1024 * 1024,
   // 同时最多开几个内置浏览器：一个 Chromium 就要 300~500MB，开多了容器直接 OOM，
@@ -109,4 +118,5 @@ export function browserHeadless() {
 
 export function ensureDirs() {
   if (!existsSync(config.dataDir)) mkdirSync(config.dataDir, { recursive: true });
+  if (!existsSync(config.clashDir)) mkdirSync(config.clashDir, { recursive: true });
 }

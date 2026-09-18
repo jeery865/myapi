@@ -22,6 +22,7 @@ import { refreshCatalog } from './models.js';
 import { needsRecheck, recheckIntervalMs, advanceRescue, providerHasNoProbe } from './account-status.js';
 import { getUpstream } from './upstreams.js';
 import { probeUpstreamKey } from './protocols/index.js';
+import { proxyBlocksRequest } from './proxy.js';
 
 const TICK_MS = 60 * 1000;
 // 模型表自己按 REFRESH_MS（6 小时）节流，这边只要保证"总有人定期叫它"。
@@ -35,6 +36,31 @@ let timer = null;
 let lastRecheck = 0;
 let lastCatalogCall = 0;
 let busy = false;
+let lastProxySkipLog = 0;
+
+/**
+ * 出口代理开着但不可用 → 这一轮探活整个跳过。
+ *
+ * 理由和 engine.js 里请求前那道闸一样：**代理是所有账号共用的出口，它坏了不该由某个号来背**。
+ * 不加这道闸的后果很具体：
+ *   · 常规复检拿到的是 network_error，会把这个**状态写进账号** → 整池刷成坏号；
+ *   · 抢救期更糟：advanceRescue 会把这些失败当成「探活失败」推进 retryCount，
+ *     一路推过上限，然后按设置把**整池账号冻结** —— 用户只是节点掉线，回来发现号全冻了。
+ * 跳过的代价只是状态晚一点刷新，代理恢复后下一轮自然就补上了。
+ *
+ * 3 秒 tick 会频繁命中这里，所以日志节流到 1 分钟一条。
+ */
+async function proxyBlocksProbing() {
+  if (!store.settings?.proxyEnabled) return false;
+  const blocked = await proxyBlocksRequest().catch(() => null);
+  if (!blocked) return false;
+  const now = Date.now();
+  if (now - lastProxySkipLog > 60_000) {
+    lastProxySkipLog = now;
+    console.log(`[scheduler] 出口代理不可用（${blocked}）：本轮账号探活全部跳过，等它恢复`);
+  }
+  return true;
+}
 
 /** 找出"到期了、需要实测一下"的账号 */
 function pendingAccounts(now = Date.now()) {
@@ -58,6 +84,8 @@ function pendingAccounts(now = Date.now()) {
  * 返回实际复检了几个。
  */
 export async function recheckAccounts(batch = RECHECK_BATCH) {
+  // 出口坏了就整轮跳过：探活结果会是清一色的 network_error，写进账号等于把整池标坏
+  if (await proxyBlocksProbing()) return 0;
   const pending = pendingAccounts().slice(0, batch);
   if (!pending.length) return 0;
   let done = 0;
@@ -164,6 +192,10 @@ export async function runRescueTick(probeFn = probeAccountForRescue) {
   if (rescueBusy) return; // 上一轮还没跑完，别叠起来
   rescueBusy = true;
   try {
+    // 出口坏了就整轮跳过。这里比常规复检更要紧：抢救期会把探活失败算成「重试失败」，
+    // 一路推进到超限，然后按设置把整池冻结 —— 用户只是节点掉线，代价却是号全被冻。
+    // 跳过是无害的：retryAt 留在过去不动，代理一恢复这一轮立刻继续。
+    if (await proxyBlocksProbing()) return;
     const now = Date.now();
     const settings = store.settings;
     const due = store.accounts.filter(

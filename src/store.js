@@ -5,7 +5,7 @@ import { randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { dirname } from 'node:path';
 import { config } from './config.js';
-import { randomId, generateApiKey, nowIso, constantTimeEqual } from './util.js';
+import { randomId, generateApiKey, nowIso, constantTimeEqual, isPublicHttpUrl } from './util.js';
 
 const scryptAsync = promisify(scrypt);
 const CURRENT_VERSION = 1;
@@ -88,6 +88,16 @@ function emptyData() {
       accountRetryMax: 5,
       accountFreezeEnabled: false,
       accountFreezeMinutes: 30,
+      // 出口代理：把上游出站流量走 Clash 订阅里的节点（伪装出口 IP）。
+      //   proxyEnabled          总开关；默认关（= 直连，与升级前行为完全一致）
+      //   proxySubscriptionUrl  订阅地址；拉下来的原文存 <DATA_DIR>/clash/sub.yaml
+      //   proxySelectedNode     当前选中的节点名；空 = 用策略组默认（第一个可用）
+      //   proxyBlockOnFailure   代理不可用时是否阻断请求；默认 true
+      //                         （用户明确要"宁可不可用，也不暴露真实 IP"）
+      proxyEnabled: false,
+      proxySubscriptionUrl: '',
+      proxySelectedNode: '',
+      proxyBlockOnFailure: true,
     },
     // 模型实测状态：id -> { state, at, detail, fails }
     modelStatus: {},
@@ -572,6 +582,33 @@ class Store {
     if ('activeAccountId' in patch) {
       const id = patch.activeAccountId ? String(patch.activeAccountId) : null;
       s.activeAccountId = id && this.data.accounts.some((a) => a.id === id) ? id : null;
+    }
+    // ── 出口代理 ────────────────────────────────────────────────────────────
+    // 两个布尔开关照 accountFreezeEnabled 的处理：接受真布尔；字符串显式解析
+    // （"false" → false），绝不让 Boolean("false") 把"关"误判成"开"。
+    if ('proxyEnabled' in patch) {
+      const raw = patch.proxyEnabled;
+      if (typeof raw === 'boolean') s.proxyEnabled = raw;
+      else if (typeof raw === 'string') s.proxyEnabled = raw.trim().toLowerCase() !== 'false';
+    }
+    if ('proxyBlockOnFailure' in patch) {
+      const raw = patch.proxyBlockOnFailure;
+      if (typeof raw === 'boolean') s.proxyBlockOnFailure = raw;
+      else if (typeof raw === 'string') s.proxyBlockOnFailure = raw.trim().toLowerCase() !== 'false';
+    }
+    if ('proxySubscriptionUrl' in patch) {
+      // 空字符串是合法值（= 清空订阅）。非空则必须是 http(s)，且拦掉内网地址 ——
+      // 这个地址是服务端去 GET 的，放任 file:// 或内网地址等于给了个 SSRF 口子。
+      const raw = String(patch.proxySubscriptionUrl ?? '').trim();
+      if (raw === '') s.proxySubscriptionUrl = '';
+      // 订阅 URL 里通常带机场的用户凭据，明文 http 会泄露 + 可被投毒，所以只认 https。
+      else if (raw.length <= 2048 && isPublicHttpUrl(raw, { requireHttps: true })) s.proxySubscriptionUrl = raw;
+      // 不合法就保留原值（静默拒收，与其它字段一致）
+    }
+    if ('proxySelectedNode' in patch) {
+      const raw = String(patch.proxySelectedNode ?? '').trim();
+      // 空 = 自动（用策略组默认）。节点名是控制台从 mihomo 读出来的，这里只做长度兜底。
+      if (raw.length <= 128) s.proxySelectedNode = raw;
     }
     if (Array.isArray(patch.disabledModels)) s.disabledModels = patch.disabledModels.map(String);
     if (patch.rotationRules && typeof patch.rotationRules === 'object') {
